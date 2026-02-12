@@ -61,6 +61,13 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         gpu_memory_utilization=0.92,
         is_moe=True,
     ),
+    "qwen-32b": ModelPreset(
+        name="qwen-32b",
+        model_id="Qwen/Qwen3-32B",
+        gpu="B200",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.92,
+    ),
 }
 
 
@@ -322,7 +329,7 @@ COMMON_FUNCTION_ARGS: dict[str, object] = {
 def _remote_run(
     preset_name: str,
     *,
-    limit: int | None = 200,
+    limit: int | None = None,
     strategy: str = "single_shot",
     split_file: str = "dev.json",
     db_id: str | None = None,
@@ -377,7 +384,7 @@ def _remote_run(
 
 @app.function(gpu=MODEL_PRESETS["qwen-8b"].gpu, **COMMON_FUNCTION_ARGS)
 def run_qwen_8b_remote(
-    limit: int | None = 200,
+    limit: int | None = None,
     strategy: str = "single_shot",
     split_file: str = "dev.json",
     db_id: str | None = None,
@@ -431,7 +438,7 @@ def run_qwen_8b_remote(
 
 @app.function(gpu=MODEL_PRESETS["qwen-30b"].gpu, **COMMON_FUNCTION_ARGS)
 def run_qwen_30b_remote(
-    limit: int | None = 200,
+    limit: int | None = None,
     strategy: str = "single_shot",
     split_file: str = "dev.json",
     db_id: str | None = None,
@@ -483,10 +490,64 @@ def run_qwen_30b_remote(
     )
 
 
+@app.function(gpu=MODEL_PRESETS["qwen-32b"].gpu, **COMMON_FUNCTION_ARGS)
+def run_qwen_32b_remote(
+    limit: int | None = None,
+    strategy: str = "single_shot",
+    split_file: str = "dev.json",
+    db_id: str | None = None,
+    offset: int = 0,
+    no_evidence: bool = True,
+    data_dictionary_mode: str = "stats_and_samples",
+    data_dictionary_max_values: int = 3,
+    schema_sample_rows: int = 0,
+    max_columns_per_table: int = 80,
+    ordered_result_compare: bool = False,
+    query_timeout_seconds: float = 20.0,
+    no_query_tool: bool = False,
+    query_tool_max_calls: int = 8,
+    query_tool_max_rows: int = 50,
+    query_tool_max_output_chars: int = 6000,
+    query_tool_max_cell_chars: int = 200,
+    query_tool_timeout_seconds: float = 8.0,
+    model_id_override: str | None = None,
+    lora_adapter_path: str | None = None,
+    lora_adapter_name: str = "sqlrl",
+    temperature: float = 0.6,
+    top_p: float | None = 0.95,
+) -> dict:
+    return _remote_run(
+        "qwen-32b",
+        limit=limit,
+        strategy=strategy,
+        split_file=split_file,
+        db_id=db_id,
+        offset=offset,
+        no_evidence=no_evidence,
+        data_dictionary_mode=data_dictionary_mode,
+        data_dictionary_max_values=data_dictionary_max_values,
+        schema_sample_rows=schema_sample_rows,
+        max_columns_per_table=max_columns_per_table,
+        ordered_result_compare=ordered_result_compare,
+        query_timeout_seconds=query_timeout_seconds,
+        no_query_tool=no_query_tool,
+        query_tool_max_calls=query_tool_max_calls,
+        query_tool_max_rows=query_tool_max_rows,
+        query_tool_max_output_chars=query_tool_max_output_chars,
+        query_tool_max_cell_chars=query_tool_max_cell_chars,
+        query_tool_timeout_seconds=query_tool_timeout_seconds,
+        model_id_override=model_id_override,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+
 @app.local_entrypoint()
 def main(
     model_preset: str = "qwen-8b",
-    limit: int | None = 200,
+    limit: int | None = None,
     strategy: str = "single_shot",
     split_file: str = "dev.json",
     db_id: str | None = None,
@@ -540,9 +601,11 @@ def main(
         "top_p": top_p,
     }
 
-    if model_preset == "qwen-8b":
-        summary = run_qwen_8b_remote.remote(**kwargs)
-    else:
-        summary = run_qwen_30b_remote.remote(**kwargs)
+    remote_fn = {
+        "qwen-8b": run_qwen_8b_remote,
+        "qwen-30b": run_qwen_30b_remote,
+        "qwen-32b": run_qwen_32b_remote,
+    }[model_preset]
+    summary = remote_fn.remote(**kwargs)
 
     print(json.dumps(summary, indent=2))
