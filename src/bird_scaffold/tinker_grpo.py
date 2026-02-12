@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import math
@@ -1173,16 +1172,6 @@ def _resolve_wandb_settings(
     default_wandb_name: str,
     log_path: Path,
 ) -> tuple[str | None, str | None]:
-    wandb_enabled = bool(config.wandb_project)
-    if not wandb_enabled:
-        return None, None
-
-    if importlib.util.find_spec("wandb") is None:
-        raise RuntimeError(
-            "wandb is not installed. Install it first (`uv pip install wandb` "
-            "or `uv sync --extra rl`)."
-        )
-
     os.environ.setdefault("WANDB_DIR", str(log_path))
 
     wandb_mode = os.environ.get("WANDB_MODE", "online")
