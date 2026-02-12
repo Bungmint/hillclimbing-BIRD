@@ -61,7 +61,7 @@ class RunConfig:
     dataset_root: Path
     split_file: str = "dev.json"
     strategy_name: str = "single_shot"
-    model: str = "Qwen/Qwen3-8B"
+    model: str = "gpt-5-mini"
     api_base_url: str | None = None
     api_key: str | None = None
     reasoning_effort: str | None = "high"

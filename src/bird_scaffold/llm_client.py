@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from langfuse.openai import OpenAI
+from langfuse.openai import openai
 
 from bird_scaffold.query_tool import (
     QUERY_TOOL_NAME,
@@ -64,7 +64,7 @@ class OpenAICompatibleText2SQLClient:
             timeout_seconds=query_tool_timeout_seconds,
         ).validated()
 
-        self._client = OpenAI(api_key=resolved_key, base_url=resolved_base_url)
+        self._client = openai.OpenAI(api_key=resolved_key, base_url=resolved_base_url)
         self._trace_context: dict[str, Any] = {}
 
     def set_trace_context(self, **kwargs: Any) -> None:
@@ -72,7 +72,8 @@ class OpenAICompatibleText2SQLClient:
         self._trace_context = {k: v for k, v in kwargs.items() if v is not None}
 
     def flush_traces(self) -> None:
-        self._client.flush()
+        from langfuse import Langfuse
+        Langfuse().flush()
 
     def generate_sql(
         self,
@@ -82,7 +83,7 @@ class OpenAICompatibleText2SQLClient:
     ) -> tuple[str, str, float, int, dict[str, int], list[dict[str, Any]]]:
         """Returns (sql, raw_text, elapsed, query_tool_calls, token_usage, messages)."""
         # One trace_id groups all tool-calling rounds for this generation.
-        self._active_trace_id = str(uuid.uuid4())
+        self._active_trace_id = uuid.uuid4().hex
         started = time.perf_counter()
         query_tool_executor = self._build_query_tool_executor(db_path=db_path)
         tools = [build_query_tool_schema()] if query_tool_executor is not None else None
@@ -173,8 +174,11 @@ class OpenAICompatibleText2SQLClient:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_output_tokens,
         }
+        if _looks_like_openai_base_url(self.api_base_url):
+            kwargs["max_completion_tokens"] = self.max_output_tokens
+        else:
+            kwargs["max_tokens"] = self.max_output_tokens
         if self.temperature != 0.0:
             kwargs["temperature"] = self.temperature
         if tools:
@@ -183,21 +187,31 @@ class OpenAICompatibleText2SQLClient:
         if self.reasoning_effort and _looks_like_openai_base_url(self.api_base_url):
             kwargs["reasoning_effort"] = self.reasoning_effort
 
-        # Langfuse trace context — stripped by the wrapper before hitting the API.
-        if self._trace_context:
-            kwargs.update(self._trace_context)
-        kwargs["trace_id"] = self._active_trace_id
+        # Langfuse trace context — the patched openai module intercepts these kwargs.
+        kwargs.update(
+            _build_langfuse_completion_kwargs(
+                default_trace_id=self._active_trace_id,
+                trace_context=self._trace_context,
+            )
+        )
 
-        try:
-            return self._client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            if "reasoning_effort" in kwargs and _is_reasoning_parameter_error(exc):
-                kwargs.pop("reasoning_effort", None)
+        while True:
+            try:
                 return self._client.chat.completions.create(**kwargs)
-            if "max_tokens" in kwargs and _is_max_tokens_unsupported_error(exc):
-                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-                return self._client.chat.completions.create(**kwargs)
-            raise
+            except Exception as exc:
+                if "reasoning_effort" in kwargs and _is_reasoning_parameter_error(exc):
+                    kwargs.pop("reasoning_effort", None)
+                    continue
+                if "max_tokens" in kwargs and _is_max_tokens_unsupported_error(exc):
+                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                    continue
+                if (
+                    "max_completion_tokens" in kwargs
+                    and _is_max_completion_tokens_unsupported_error(exc)
+                ):
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                raise
 
 
 def extract_sql(text: str) -> str:
@@ -334,6 +348,41 @@ def _tool_error_json(message: str) -> str:
     return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
 
 
+def _build_langfuse_completion_kwargs(
+    *,
+    default_trace_id: str,
+    trace_context: dict[str, Any],
+) -> dict[str, Any]:
+    if not trace_context:
+        return {"trace_id": default_trace_id}
+
+    context = {k: v for k, v in trace_context.items() if v is not None}
+    trace_id = context.pop("trace_id", None) or default_trace_id
+
+    metadata_raw = context.pop("metadata", None)
+    metadata_payload = dict(metadata_raw) if isinstance(metadata_raw, dict) else None
+
+    direct_keys = ("name", "langfuse_public_key", "langfuse_prompt", "parent_observation_id")
+    completion_kwargs: dict[str, Any] = {"trace_id": trace_id}
+    for key in direct_keys:
+        value = context.pop(key, None)
+        if value is not None:
+            completion_kwargs[key] = value
+
+    if context:
+        if metadata_payload is None:
+            metadata_payload = {}
+        for key, value in context.items():
+            metadata_payload.setdefault(key, value)
+
+    if metadata_payload is not None:
+        completion_kwargs["metadata"] = metadata_payload
+    elif metadata_raw is not None:
+        completion_kwargs["metadata"] = metadata_raw
+
+    return completion_kwargs
+
+
 def _looks_like_openai_base_url(base_url: str | None) -> bool:
     if base_url is None:
         return True
@@ -343,22 +392,28 @@ def _looks_like_openai_base_url(base_url: str | None) -> bool:
 
 def _is_tool_calling_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    markers = [
-        "tool",
-        "function",
-        "tool_choice",
-        "unsupported",
-        "not implemented",
-        "extra_forbidden",
-    ]
-    return any(marker in text for marker in markers)
+    if "max_tokens" in text or "max_completion_tokens" in text or "reasoning_effort" in text:
+        return False
+
+    mentions_tooling = any(marker in text for marker in ("tool", "tool_choice", "function"))
+    mentions_unsupported = any(
+        marker in text for marker in ("unsupported", "not implemented", "extra_forbidden")
+    )
+    return mentions_tooling and mentions_unsupported
 
 
 def _is_reasoning_parameter_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return "reasoning_effort" in text and ("unknown" in text or "unsupported" in text or "extra" in text)
+    return "reasoning_effort" in text and (
+        "unknown" in text or "unsupported" in text or "not supported" in text or "extra" in text
+    )
 
 
 def _is_max_tokens_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "max_tokens" in text and ("unsupported" in text or "not supported" in text)
+
+
+def _is_max_completion_tokens_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "max_completion_tokens" in text and ("unsupported" in text or "not supported" in text)

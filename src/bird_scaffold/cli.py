@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--offset", type=int, default=0)
     run.add_argument("--limit", type=int, default=None)
     run.add_argument("--strategy", default="single_shot")
-    run.add_argument("--model", default="Qwen/Qwen3-8B")
+    run.add_argument("--model", default="gpt-5-mini")
     run.add_argument(
         "--api-base-url",
         default=None,
