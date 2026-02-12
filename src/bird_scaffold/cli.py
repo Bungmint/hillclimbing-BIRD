@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -49,15 +50,25 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--offset", type=int, default=0)
     run.add_argument("--limit", type=int, default=None)
     run.add_argument("--strategy", default="single_shot")
-    run.add_argument("--model", default="gpt-5-mini")
+    run.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    run.add_argument(
+        "--api-base-url",
+        default=None,
+        help="OpenAI-compatible base URL (for vLLM use e.g. http://127.0.0.1:8000/v1).",
+    )
+    run.add_argument(
+        "--api-key",
+        default=None,
+        help="API key override. If omitted, OPENAI_API_KEY or VLLM_API_KEY are used.",
+    )
     run.add_argument(
         "--reasoning-effort",
         choices=["off", "minimal", "low", "medium", "high"],
-        default="medium",
-        help="Reasoning effort for reasoning-capable models. Use 'off' to disable.",
+        default="high",
+        help="Reasoning effort (OpenAI models only). Use 'off' to disable.",
     )
     run.add_argument("--temperature", type=float, default=0.0)
-    run.add_argument("--max-output-tokens", type=int, default=512)
+    run.add_argument("--max-output-tokens", type=int, default=4096)
     run.add_argument("--no-evidence", action="store_true")
     run.add_argument("--ordered", action="store_true")
     run.add_argument("--float-precision", type=int, default=6)
@@ -70,6 +81,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--data-dictionary-max-values", type=int, default=3)
     run.add_argument("--query-timeout", type=float, default=20.0)
+    run.add_argument("--no-query-tool", action="store_true")
+    run.add_argument("--query-tool-max-calls", type=int, default=8)
+    run.add_argument("--query-tool-max-rows", type=int, default=50)
+    run.add_argument("--query-tool-max-output-chars", type=int, default=6000)
+    run.add_argument("--query-tool-max-cell-chars", type=int, default=200)
+    run.add_argument("--query-tool-timeout", type=float, default=8.0)
     run.add_argument("--progress-every", type=int, default=10)
     run.add_argument("--output-root", default="outputs")
 
@@ -118,11 +135,16 @@ def _cmd_strategies() -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
+    api_base_url = args.api_base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("VLLM_BASE_URL")
+    api_key = args.api_key or os.getenv("OPENAI_API_KEY") or os.getenv("VLLM_API_KEY")
+
     config = RunConfig(
         dataset_root=Path(args.dataset_root),
         split_file=args.split_file,
         strategy_name=args.strategy,
         model=args.model,
+        api_base_url=api_base_url,
+        api_key=api_key,
         reasoning_effort=None if args.reasoning_effort == "off" else args.reasoning_effort,
         temperature=args.temperature,
         max_output_tokens=args.max_output_tokens,
@@ -138,6 +160,12 @@ def _cmd_run(args: argparse.Namespace) -> None:
         data_dictionary_mode=args.data_dictionary_mode,
         data_dictionary_max_values=args.data_dictionary_max_values,
         query_timeout_seconds=args.query_timeout,
+        query_tool_enabled=not args.no_query_tool,
+        query_tool_max_calls=args.query_tool_max_calls,
+        query_tool_max_rows=args.query_tool_max_rows,
+        query_tool_max_output_chars=args.query_tool_max_output_chars,
+        query_tool_max_cell_chars=args.query_tool_max_cell_chars,
+        query_tool_timeout_seconds=args.query_tool_timeout,
         progress_every=args.progress_every,
     )
 

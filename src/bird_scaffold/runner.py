@@ -9,7 +9,7 @@ from typing import Any
 from bird_scaffold.dataset import filter_examples, load_examples
 from bird_scaffold.db import load_database_context
 from bird_scaffold.execution import execute_sql, normalize_sql, results_match
-from bird_scaffold.openai_client import OpenAIText2SQLClient
+from bird_scaffold.llm_client import OpenAICompatibleText2SQLClient
 from bird_scaffold.strategies import get_strategy
 from bird_scaffold.types import DatabaseContext, RunConfig
 
@@ -68,12 +68,21 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
 
     strategy = get_strategy(config.strategy_name)
 
-    openai_client: OpenAIText2SQLClient | None = None
-    if strategy.requires_openai:
-        openai_client = OpenAIText2SQLClient(
+    llm_client: OpenAICompatibleText2SQLClient | None = None
+    if strategy.requires_llm:
+        llm_client = OpenAICompatibleText2SQLClient(
             model=config.model,
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            reasoning_effort=config.reasoning_effort,
             temperature=config.temperature,
             max_output_tokens=config.max_output_tokens,
+            query_tool_enabled=config.query_tool_enabled,
+            query_tool_max_calls=config.query_tool_max_calls,
+            query_tool_max_rows=config.query_tool_max_rows,
+            query_tool_max_output_chars=config.query_tool_max_output_chars,
+            query_tool_max_cell_chars=config.query_tool_max_cell_chars,
+            query_tool_timeout_seconds=config.query_tool_timeout_seconds,
         )
 
     run_dir = _prepare_run_dir(
@@ -92,6 +101,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     executable_count = 0
     generation_error_count = 0
     gold_exec_error_count = 0
+    query_tool_calls_total = 0
 
     total = len(examples)
 
@@ -110,7 +120,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         generation = strategy.generate(
             example=example,
             db_context=db_context,
-            openai_client=openai_client,
+            llm_client=llm_client,
             include_evidence=config.include_evidence,
         )
 
@@ -141,6 +151,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
 
         if generation.error:
             generation_error_count += 1
+        query_tool_calls_total += generation.query_tool_calls
 
         if gold_exec.error:
             gold_exec_error_count += 1
@@ -174,6 +185,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
                 "model": config.model,
                 "generation_error": generation.error,
                 "generation_latency_s": generation.latency_s,
+                "query_tool_calls": generation.query_tool_calls,
                 "prediction_exec_error": prediction_exec.error,
                 "gold_exec_error": gold_exec.error,
                 "prediction_exec_time_s": prediction_exec.elapsed_s,
@@ -210,6 +222,8 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "exact_match_accuracy": exact_match_count / total,
         "num_generation_errors": generation_error_count,
         "num_gold_exec_errors": gold_exec_error_count,
+        "num_query_tool_calls": query_tool_calls_total,
+        "avg_query_tool_calls_per_example": query_tool_calls_total / total,
         "invalid_sql_rate": 1.0 - (executable_count / total),
         "ordered_result_compare": config.ordered_result_compare,
         "float_precision": config.float_precision,

@@ -40,6 +40,7 @@ class ExecutionResult:
     columns: list[str]
     error: str | None
     elapsed_s: float
+    truncated: bool = False
 
 
 @dataclass
@@ -48,6 +49,7 @@ class GenerationResult:
     raw_output: str = ""
     error: str | None = None
     latency_s: float | None = None
+    query_tool_calls: int = 0
 
 
 @dataclass
@@ -55,9 +57,12 @@ class RunConfig:
     dataset_root: Path
     split_file: str = "dev.json"
     strategy_name: str = "single_shot"
-    model: str = "gpt-5-mini"
+    model: str = "Qwen/Qwen2.5-7B-Instruct"
+    api_base_url: str | None = None
+    api_key: str | None = None
+    reasoning_effort: str | None = "high"
     temperature: float = 0.0
-    max_output_tokens: int = 512
+    max_output_tokens: int = 4096
     limit: int | None = None
     offset: int = 0
     db_id: str | None = None
@@ -70,4 +75,10 @@ class RunConfig:
     data_dictionary_mode: str = "off"
     data_dictionary_max_values: int = 3
     query_timeout_seconds: float = 20.0
+    query_tool_enabled: bool = True
+    query_tool_max_calls: int = 8
+    query_tool_max_rows: int = 50
+    query_tool_max_output_chars: int = 6000
+    query_tool_max_cell_chars: int = 200
+    query_tool_timeout_seconds: float = 8.0
     progress_every: int = 10

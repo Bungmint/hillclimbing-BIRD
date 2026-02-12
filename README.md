@@ -4,7 +4,7 @@ Local-first scaffold for BIRD-style text-to-SQL experiments on `dev_20240627`.
 
 ## What this gives you
 
-- Baseline runner: `question -> OpenAI model -> SQL -> execute -> evaluate`
+- Baseline runner: `question -> OpenAI-compatible model (+ query tool calls) -> SQL -> execute -> evaluate`
 - Execution-accuracy style metrics against BIRD gold SQL
 - Strategy interface so you can add new ideas without changing the core loop
 - Modal entrypoint reusing the same runner for larger experiments later
@@ -14,17 +14,14 @@ Local-first scaffold for BIRD-style text-to-SQL experiments on `dev_20240627`.
 1. Create env and install:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+uv sync
 ```
 
-2. Set API key:
+2. Point to a model endpoint (vLLM local example):
 
 ```bash
-cp .env.example .env
-# edit .env and set OPENAI_API_KEY
+export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+export OPENAI_API_KEY=EMPTY
 ```
 
 3. Preview dataset wiring:
@@ -38,7 +35,9 @@ bird-scaffold preview --dataset-root dev_20240627
 ```bash
 bird-scaffold run \
   --dataset-root dev_20240627 \
-  --model gpt-4.1-mini \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --api-base-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY \
   --strategy single_shot \
   --data-dictionary-mode off \
   --limit 20
@@ -49,7 +48,9 @@ Run Idea 1A (schema + data dictionary) with the same baseline strategy:
 ```bash
 bird-scaffold run \
   --dataset-root dev_20240627 \
-  --model gpt-4.1-mini \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --api-base-url http://127.0.0.1:8000/v1 \
+  --api-key EMPTY \
   --strategy single_shot \
   --data-dictionary-mode stats_and_samples \
   --limit 20
@@ -87,6 +88,23 @@ Add a strategy in `src/bird_scaffold/strategies/`:
 
 This keeps data loading, execution, and evaluation unchanged while you iterate on prompting, repair, reranking, or self-consistency.
 
+## Query Tool (default on)
+
+`single_shot` now enables a function tool named `query(sql)` by default.
+
+- Tool queries run read-only against the current example's SQLite database.
+- Tool results are truncated by row count and output size for prompt safety.
+- Final answer is still a single SQL query returned by the model.
+
+Useful flags for production control:
+
+- `--no-query-tool`
+- `--query-tool-max-calls`
+- `--query-tool-max-rows`
+- `--query-tool-max-output-chars`
+- `--query-tool-max-cell-chars`
+- `--query-tool-timeout`
+
 ## Data Dictionary Modes (Idea 1A)
 
 - `--data-dictionary-mode off`: baseline schema-only prompt (default)
@@ -95,9 +113,17 @@ This keeps data loading, execution, and evaluation unchanged while you iterate o
 
 This is designed for direct ablations without changing strategy code.
 
-## Modal later
+## Modal vLLM
 
-`modal_app.py` provides a starter for remote execution with the same runner.
+`modal_app.py` now starts vLLM in-container and runs the same experiment loop against it.
 
-- Keep local development with `bird-scaffold run`
-- Move heavier sweeps to Modal by copying dataset to a Modal Volume and setting a Modal Secret for `OPENAI_API_KEY`
+Supported presets:
+
+- `qwen-8b` -> `Qwen/Qwen2.5-7B-Instruct`
+- `qwen-30b` -> `Qwen/Qwen2.5-32B-Instruct`
+
+Example:
+
+```bash
+modal run modal_app.py --model-preset qwen-8b --limit 200 --strategy single_shot
+```

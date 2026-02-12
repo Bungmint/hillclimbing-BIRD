@@ -9,7 +9,12 @@ from typing import Any
 from bird_scaffold.types import ExecutionResult
 
 
-def execute_sql(db_path: Path, sql: str, timeout_seconds: float = 20.0) -> ExecutionResult:
+def execute_sql(
+    db_path: Path,
+    sql: str,
+    timeout_seconds: float = 20.0,
+    max_rows: int | None = None,
+) -> ExecutionResult:
     started = time.perf_counter()
     conn: sqlite3.Connection | None = None
 
@@ -26,17 +31,27 @@ def execute_sql(db_path: Path, sql: str, timeout_seconds: float = 20.0) -> Execu
         cur.execute(sql)
 
         if cur.description:
-            rows = cur.fetchall()
+            if max_rows is None:
+                rows = cur.fetchall()
+                truncated = False
+            else:
+                if max_rows < 0:
+                    raise ValueError("max_rows must be non-negative when provided")
+                fetched = cur.fetchmany(max_rows + 1)
+                truncated = len(fetched) > max_rows
+                rows = fetched[:max_rows]
             columns = [col[0] for col in cur.description]
         else:
             rows = []
             columns = []
+            truncated = False
 
         return ExecutionResult(
             rows=rows,
             columns=columns,
             error=None,
             elapsed_s=time.perf_counter() - started,
+            truncated=truncated,
         )
     except Exception as exc:
         return ExecutionResult(
@@ -44,6 +59,7 @@ def execute_sql(db_path: Path, sql: str, timeout_seconds: float = 20.0) -> Execu
             columns=[],
             error=str(exc),
             elapsed_s=time.perf_counter() - started,
+            truncated=False,
         )
     finally:
         if conn is not None:
