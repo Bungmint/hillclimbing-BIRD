@@ -35,7 +35,8 @@ class OpenAICompatibleText2SQLClient:
         api_base_url: str | None = None,
         api_key: str | None = None,
         reasoning_effort: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = 0.0,
+        top_p: float | None = None,
         max_output_tokens: int = 4096,
         query_tool_enabled: bool = True,
         query_tool_max_calls: int = 8,
@@ -54,6 +55,7 @@ class OpenAICompatibleText2SQLClient:
         self.api_base_url = resolved_base_url
         self.reasoning_effort = reasoning_effort
         self.temperature = temperature
+        self.top_p = top_p
         self.max_output_tokens = max_output_tokens
         self.query_tool_enabled = query_tool_enabled
         self.query_tool_config = QueryToolConfig(
@@ -66,6 +68,8 @@ class OpenAICompatibleText2SQLClient:
 
         self._client = openai.OpenAI(api_key=resolved_key, base_url=resolved_base_url)
         self._trace_context: dict[str, Any] = {}
+        self._skip_temperature = False
+        self._skip_top_p = False
 
     def set_trace_context(self, **kwargs: Any) -> None:
         """Set Langfuse trace metadata for subsequent generate_sql calls."""
@@ -179,8 +183,10 @@ class OpenAICompatibleText2SQLClient:
             kwargs["max_completion_tokens"] = self.max_output_tokens
         else:
             kwargs["max_tokens"] = self.max_output_tokens
-        if self.temperature != 0.0:
+        if self.temperature is not None and not self._skip_temperature:
             kwargs["temperature"] = self.temperature
+        if self.top_p is not None and not self._skip_top_p:
+            kwargs["top_p"] = self.top_p
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -210,6 +216,14 @@ class OpenAICompatibleText2SQLClient:
                     and _is_max_completion_tokens_unsupported_error(exc)
                 ):
                     kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                if "temperature" in kwargs and _is_temperature_unsupported_error(exc):
+                    kwargs.pop("temperature", None)
+                    self._skip_temperature = True
+                    continue
+                if "top_p" in kwargs and _is_top_p_unsupported_error(exc):
+                    kwargs.pop("top_p", None)
+                    self._skip_top_p = True
                     continue
                 raise
 
@@ -391,7 +405,7 @@ def _looks_like_openai_base_url(base_url: str | None) -> bool:
 
 
 def _is_tool_calling_unsupported_error(exc: Exception) -> bool:
-    text = str(exc).lower()
+    text = _error_text(exc)
     if "max_tokens" in text or "max_completion_tokens" in text or "reasoning_effort" in text:
         return False
 
@@ -403,17 +417,67 @@ def _is_tool_calling_unsupported_error(exc: Exception) -> bool:
 
 
 def _is_reasoning_parameter_error(exc: Exception) -> bool:
-    text = str(exc).lower()
+    text = _error_text(exc)
     return "reasoning_effort" in text and (
-        "unknown" in text or "unsupported" in text or "not supported" in text or "extra" in text
+        "unknown" in text
+        or "unsupported" in text
+        or "not supported" in text
+        or "does not support" in text
+        or "extra" in text
     )
 
 
 def _is_max_tokens_unsupported_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "max_tokens" in text and ("unsupported" in text or "not supported" in text)
+    text = _error_text(exc)
+    return "max_tokens" in text and (
+        "unsupported" in text or "not supported" in text or "does not support" in text
+    )
 
 
 def _is_max_completion_tokens_unsupported_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "max_completion_tokens" in text and ("unsupported" in text or "not supported" in text)
+    text = _error_text(exc)
+    return "max_completion_tokens" in text and (
+        "unsupported" in text or "not supported" in text or "does not support" in text
+    )
+
+
+def _is_temperature_unsupported_error(exc: Exception) -> bool:
+    text = _error_text(exc)
+    return "temperature" in text and (
+        "unsupported" in text
+        or "unsupported value" in text
+        or "unsupported_value" in text
+        or "not supported" in text
+        or "does not support" in text
+    )
+
+
+def _is_top_p_unsupported_error(exc: Exception) -> bool:
+    text = _error_text(exc)
+    return "top_p" in text and (
+        "unsupported" in text
+        or "unsupported value" in text
+        or "not supported" in text
+        or "unsupported_value" in text
+        or "does not support" in text
+    )
+
+
+def _error_text(exc: Exception) -> str:
+    parts: list[str] = [str(exc)]
+    message = getattr(exc, "message", None)
+    body = getattr(exc, "body", None)
+    response = getattr(exc, "response", None)
+
+    for value in (message, body, response):
+        if value is None:
+            continue
+        if isinstance(value, str):
+            parts.append(value)
+            continue
+        try:
+            parts.append(json.dumps(value, ensure_ascii=False))
+        except Exception:
+            parts.append(str(value))
+
+    return " ".join(parts).lower()

@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from collections import Counter
 from pathlib import Path
+from typing import TypeVar
 
 from dotenv import load_dotenv
 
@@ -19,6 +19,8 @@ from bird_scaffold.db import load_database_context, resolve_db_path
 from bird_scaffold.runner import run_experiment
 from bird_scaffold.strategies import list_strategies
 from bird_scaffold.types import RunConfig
+
+T = TypeVar("T")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
     show_schema.add_argument(
         "--data-dictionary-mode",
         choices=[DATA_DICTIONARY_MODE_OFF, DATA_DICTIONARY_MODE_STATS, DATA_DICTIONARY_MODE_STATS_AND_SAMPLES],
-        default=DATA_DICTIONARY_MODE_OFF,
+        default=DATA_DICTIONARY_MODE_STATS_AND_SAMPLES,
     )
     show_schema.add_argument("--data-dictionary-max-values", type=int, default=3)
 
@@ -69,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--max-output-tokens", type=int, default=4096)
-    run.add_argument("--no-evidence", action="store_true")
+    run.add_argument("--evidence", action="store_true")
     run.add_argument("--ordered", action="store_true")
     run.add_argument("--float-precision", type=int, default=6)
     run.add_argument("--schema-sample-rows", type=int, default=0)
@@ -77,7 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--data-dictionary-mode",
         choices=[DATA_DICTIONARY_MODE_OFF, DATA_DICTIONARY_MODE_STATS, DATA_DICTIONARY_MODE_STATS_AND_SAMPLES],
-        default=DATA_DICTIONARY_MODE_OFF,
+        default=DATA_DICTIONARY_MODE_STATS_AND_SAMPLES,
     )
     run.add_argument("--data-dictionary-max-values", type=int, default=3)
     run.add_argument("--query-timeout", type=float, default=20.0)
@@ -88,6 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--query-tool-max-cell-chars", type=int, default=200)
     run.add_argument("--query-tool-timeout", type=float, default=8.0)
     run.add_argument("--progress-every", type=int, default=10)
+    run.add_argument("--max-workers", type=int, default=8, help="Number of parallel workers for evaluation")
     run.add_argument("--output-root", default="outputs")
 
     rl_train = subparsers.add_parser("rl-train", help="Run Tinker GRPO training on BIRD")
@@ -102,47 +105,58 @@ def _build_parser() -> argparse.ArgumentParser:
     rl_train.add_argument("--eval-limit", type=int, default=64)
     rl_train.add_argument("--no-shuffle", action="store_true")
     rl_train.add_argument("--seed", type=int, default=0)
-    rl_train.add_argument("--no-evidence", action="store_true")
+    rl_train.add_argument("--evidence", action="store_true")
     rl_train.add_argument(
         "--data-dictionary-mode",
         choices=[DATA_DICTIONARY_MODE_OFF, DATA_DICTIONARY_MODE_STATS, DATA_DICTIONARY_MODE_STATS_AND_SAMPLES],
-        default=DATA_DICTIONARY_MODE_OFF,
+        default=DATA_DICTIONARY_MODE_STATS_AND_SAMPLES,
     )
     rl_train.add_argument("--data-dictionary-max-values", type=int, default=3)
     rl_train.add_argument("--schema-sample-rows", type=int, default=0)
     rl_train.add_argument("--max-columns", type=int, default=80)
     rl_train.add_argument("--query-timeout", type=float, default=20.0)
+    rl_train.add_argument("--no-query-tool", action="store_true")
+    rl_train.add_argument("--query-tool-max-calls", type=int, default=8)
+    rl_train.add_argument("--query-tool-max-rows", type=int, default=50)
+    rl_train.add_argument("--query-tool-max-output-chars", type=int, default=6000)
+    rl_train.add_argument("--query-tool-max-cell-chars", type=int, default=200)
+    rl_train.add_argument("--query-tool-timeout", type=float, default=8.0)
+    rl_train.add_argument("--max-turns", type=int, default=None)
+    rl_train.add_argument("--max-trajectory-tokens", type=int, default=32 * 1024)
+    rl_train.add_argument("--failed-parse-reward", type=float, default=-0.1)
+    rl_train.add_argument("--continue-on-parse-error", action="store_true")
     rl_train.add_argument("--ordered", action="store_true")
     rl_train.add_argument("--float-precision", type=int, default=6)
     rl_train.add_argument("--group-size", type=int, default=8)
     rl_train.add_argument("--groups-per-batch", type=int, default=16)
     rl_train.add_argument("--learning-rate", type=float, default=1e-5)
-    rl_train.add_argument("--max-tokens", type=int, default=512)
+    rl_train.add_argument("--max-tokens", type=int, default=4096)
     rl_train.add_argument("--temperature", type=float, default=1.0)
     rl_train.add_argument("--lora-rank", type=int, default=32)
     rl_train.add_argument("--kl-penalty-coef", type=float, default=0.0)
+    rl_train.add_argument("--kl-discount-factor", type=float, default=0.0)
+    rl_train.add_argument("--compute-post-kl", action="store_true")
     rl_train.add_argument("--num-substeps", type=int, default=1)
+    rl_train.add_argument("--loss-fn-config-json", default=None)
     rl_train.add_argument(
         "--loss-fn",
         choices=["importance_sampling", "ppo"],
         default="importance_sampling",
     )
     rl_train.add_argument("--max-steps-off-policy", type=int, default=None)
+    rl_train.add_argument("--stream-minibatch", action="store_true")
+    rl_train.add_argument("--num-minibatches", type=int, default=4)
     rl_train.add_argument("--reward-exec-match", type=float, default=1.0)
     rl_train.add_argument("--reward-executable", type=float, default=0.0)
     rl_train.add_argument("--reward-exact-sql", type=float, default=0.0)
-    rl_train.add_argument("--eval-every", type=int, default=20)
-    rl_train.add_argument("--save-every", type=int, default=20)
+    rl_train.add_argument("--eval-every", type=int, default=10)
+    rl_train.add_argument("--save-every", type=int, default=10)
+    rl_train.add_argument("--num-groups-to-log", type=int, default=4)
     rl_train.add_argument("--log-path", default=None)
     rl_train.add_argument("--load-checkpoint-path", default=None)
     rl_train.add_argument("--base-url", default=None)
     rl_train.add_argument("--wandb-project", default=None)
     rl_train.add_argument("--wandb-name", default=None)
-    rl_train.add_argument(
-        "--behavior-if-log-dir-exists",
-        choices=["ask", "error", "overwrite"],
-        default="ask",
-    )
 
     return parser
 
@@ -205,7 +219,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         limit=args.limit,
         offset=args.offset,
         db_id=args.db_id,
-        include_evidence=not args.no_evidence,
+        include_evidence=args.evidence,
         output_root=Path(args.output_root),
         ordered_result_compare=args.ordered,
         float_precision=args.float_precision,
@@ -221,22 +235,25 @@ def _cmd_run(args: argparse.Namespace) -> None:
         query_tool_max_cell_chars=args.query_tool_max_cell_chars,
         query_tool_timeout_seconds=args.query_tool_timeout,
         progress_every=args.progress_every,
+        max_workers=args.max_workers,
     )
 
     summary = run_experiment(config)
     print(json.dumps(summary, indent=2))
 
 
-def _cmd_rl_train(args: argparse.Namespace) -> None:
-    try:
-        from bird_scaffold.tinker_grpo import TinkerGRPOConfig, run_tinker_grpo_training
-    except ImportError as exc:
-        raise RuntimeError(
-            "Tinker RL dependencies are missing. Install them first (for example: "
-            "`uv sync --extra rl` or `uv pip install tinker tinker_cookbook chz`)."
-        ) from exc
+def _parse_json_object(raw: str | None) -> dict[str, object] | None:
+    if raw is None:
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+    return parsed
 
-    config = TinkerGRPOConfig(
+
+def _build_tinker_grpo_config(args: argparse.Namespace, config_cls: type[T]) -> T:
+    loss_fn_config = _parse_json_object(args.loss_fn_config_json)
+    return config_cls(
         dataset_root=Path(args.dataset_root),
         split_file=args.split_file,
         model=args.model,
@@ -248,12 +265,22 @@ def _cmd_rl_train(args: argparse.Namespace) -> None:
         eval_limit=args.eval_limit,
         shuffle=not args.no_shuffle,
         seed=args.seed,
-        include_evidence=not args.no_evidence,
+        include_evidence=args.evidence,
         data_dictionary_mode=args.data_dictionary_mode,
         data_dictionary_max_values=args.data_dictionary_max_values,
         schema_sample_rows=args.schema_sample_rows,
         max_columns_per_table=args.max_columns,
         query_timeout_seconds=args.query_timeout,
+        query_tool_enabled=not args.no_query_tool,
+        query_tool_max_calls=args.query_tool_max_calls,
+        query_tool_max_rows=args.query_tool_max_rows,
+        query_tool_max_output_chars=args.query_tool_max_output_chars,
+        query_tool_max_cell_chars=args.query_tool_max_cell_chars,
+        query_tool_timeout_seconds=args.query_tool_timeout,
+        max_turns=args.max_turns,
+        max_trajectory_tokens=args.max_trajectory_tokens,
+        failed_parse_reward=args.failed_parse_reward,
+        terminate_on_parse_error=not args.continue_on_parse_error,
         ordered_result_compare=args.ordered,
         float_precision=args.float_precision,
         group_size=args.group_size,
@@ -263,21 +290,32 @@ def _cmd_rl_train(args: argparse.Namespace) -> None:
         temperature=args.temperature,
         lora_rank=args.lora_rank,
         kl_penalty_coef=args.kl_penalty_coef,
+        kl_discount_factor=args.kl_discount_factor,
+        compute_post_kl=args.compute_post_kl,
         num_substeps=args.num_substeps,
         loss_fn=args.loss_fn,
+        loss_fn_config=loss_fn_config,
         max_steps_off_policy=args.max_steps_off_policy,
+        stream_minibatch=args.stream_minibatch,
+        num_minibatches=args.num_minibatches,
         reward_exec_match=args.reward_exec_match,
         reward_executable=args.reward_executable,
         reward_exact_sql=args.reward_exact_sql,
         eval_every=args.eval_every,
         save_every=args.save_every,
+        num_groups_to_log=args.num_groups_to_log,
         log_path=Path(args.log_path) if args.log_path else None,
         load_checkpoint_path=args.load_checkpoint_path,
         base_url=args.base_url,
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,
-        behavior_if_log_dir_exists=args.behavior_if_log_dir_exists,
     )
+
+
+def _cmd_rl_train(args: argparse.Namespace) -> None:
+    from bird_scaffold.tinker_grpo import TinkerGRPOConfig, run_tinker_grpo_training
+
+    config = _build_tinker_grpo_config(args, TinkerGRPOConfig)
 
     summary = run_tinker_grpo_training(config)
     print(json.dumps(summary, indent=2))
@@ -287,38 +325,34 @@ def main() -> None:
     load_dotenv()
     parser = _build_parser()
     args = parser.parse_args()
-    try:
-        if args.command == "preview":
-            _cmd_preview(dataset_root=Path(args.dataset_root), split_file=args.split_file)
-            return
+    if args.command == "preview":
+        _cmd_preview(dataset_root=Path(args.dataset_root), split_file=args.split_file)
+        return
 
-        if args.command == "show-schema":
-            _cmd_show_schema(
-                dataset_root=Path(args.dataset_root),
-                db_id=args.db_id,
-                sample_rows=args.sample_rows,
-                max_columns=args.max_columns,
-                data_dictionary_mode=args.data_dictionary_mode,
-                data_dictionary_max_values=args.data_dictionary_max_values,
-            )
-            return
+    if args.command == "show-schema":
+        _cmd_show_schema(
+            dataset_root=Path(args.dataset_root),
+            db_id=args.db_id,
+            sample_rows=args.sample_rows,
+            max_columns=args.max_columns,
+            data_dictionary_mode=args.data_dictionary_mode,
+            data_dictionary_max_values=args.data_dictionary_max_values,
+        )
+        return
 
-        if args.command == "strategies":
-            _cmd_strategies()
-            return
+    if args.command == "strategies":
+        _cmd_strategies()
+        return
 
-        if args.command == "run":
-            _cmd_run(args)
-            return
+    if args.command == "run":
+        _cmd_run(args)
+        return
 
-        if args.command == "rl-train":
-            _cmd_rl_train(args)
-            return
+    if args.command == "rl-train":
+        _cmd_rl_train(args)
+        return
 
-        raise ValueError(f"Unsupported command: {args.command}")
-    except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    raise ValueError(f"Unsupported command: {args.command}")
 
 
 if __name__ == "__main__":

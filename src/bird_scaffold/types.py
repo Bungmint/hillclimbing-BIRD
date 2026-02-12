@@ -66,17 +66,18 @@ class RunConfig:
     api_key: str | None = None
     reasoning_effort: str | None = "high"
     temperature: float = 0.0
+    top_p: float | None = None
     max_output_tokens: int = 4096
     limit: int | None = None
     offset: int = 0
     db_id: str | None = None
-    include_evidence: bool = True
+    include_evidence: bool = False
     output_root: Path = Path("outputs")
     ordered_result_compare: bool = False
     float_precision: int = 6
     schema_sample_rows: int = 0
     max_columns_per_table: int = 80
-    data_dictionary_mode: str = "off"
+    data_dictionary_mode: str = "stats_and_samples"
     data_dictionary_max_values: int = 3
     query_timeout_seconds: float = 20.0
     query_tool_enabled: bool = True
@@ -86,3 +87,4 @@ class RunConfig:
     query_tool_max_cell_chars: int = 200
     query_tool_timeout_seconds: float = 8.0
     progress_every: int = 10
+    max_workers: int = 8

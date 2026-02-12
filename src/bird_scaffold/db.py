@@ -83,7 +83,7 @@ def load_database_context(
     db_id: str,
     sample_rows_per_table: int = 0,
     max_columns_per_table: int = 80,
-    data_dictionary_mode: str = "off",
+    data_dictionary_mode: str = "stats_and_samples",
     data_dictionary_max_values: int = 3,
 ) -> DatabaseContext:
     db_path = resolve_db_path(dataset_root, db_id)

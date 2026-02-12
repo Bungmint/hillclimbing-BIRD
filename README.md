@@ -147,7 +147,7 @@ modal run modal_app.py \
 Install RL dependencies first:
 
 ```bash
-uv pip install tinker tinker_cookbook chz
+uv sync --extra rl
 ```
 
 Run vanilla GRPO with execution-outcome reward (default model is `Qwen/Qwen3-8B`):
@@ -168,3 +168,15 @@ bird-scaffold rl-train \
 
 Training logs/checkpoint metadata are written under `outputs/tinker_grpo/...`.
 Use the saved adapter/checkpoint from that run for Modal serving and eval.
+
+W&B lock-in example:
+
+```bash
+export WANDB_API_KEY=...
+bird-scaffold rl-train \
+  --dataset-root dev_20240627 \
+  --model Qwen/Qwen3-8B \
+  --wandb-lock-in \
+  --wandb-project bird-sql-grpo \
+  --wandb-mode online
+```

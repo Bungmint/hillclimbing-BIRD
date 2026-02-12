@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +13,7 @@ from bird_scaffold.db import load_database_context
 from bird_scaffold.execution import execute_sql, normalize_sql, results_match
 from bird_scaffold.llm_client import OpenAICompatibleText2SQLClient
 from bird_scaffold.strategies import get_strategy
-from bird_scaffold.types import DatabaseContext, RunConfig
+from bird_scaffold.types import BirdExample, DatabaseContext, RunConfig
 
 
 def _run_dir_name(strategy_name: str, model: str) -> str:
@@ -53,6 +55,149 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+_thread_local = threading.local()
+
+
+def _looks_like_openai_endpoint(base_url: str | None) -> bool:
+    if base_url is None:
+        return True
+    return "api.openai.com" in base_url.lower()
+
+
+def _resolve_generation_temperature(config: RunConfig) -> float | None:
+    # GPT-5 chat-completions can reject explicit temperature=0.0;
+    # omit the param to let the model use its server default.
+    if (
+        _looks_like_openai_endpoint(config.api_base_url)
+        and config.model.lower().startswith("gpt-5")
+        and config.temperature == 0.0
+    ):
+        return None
+    return config.temperature
+
+
+def _get_thread_llm_client(config: RunConfig) -> OpenAICompatibleText2SQLClient:
+    """Return a per-thread LLM client (created lazily, reused within the same thread)."""
+    client = getattr(_thread_local, "llm_client", None)
+    if client is None:
+        client = OpenAICompatibleText2SQLClient(
+            model=config.model,
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            reasoning_effort=config.reasoning_effort,
+            temperature=_resolve_generation_temperature(config),
+            top_p=config.top_p,
+            max_output_tokens=config.max_output_tokens,
+            query_tool_enabled=config.query_tool_enabled,
+            query_tool_max_calls=config.query_tool_max_calls,
+            query_tool_max_rows=config.query_tool_max_rows,
+            query_tool_max_output_chars=config.query_tool_max_output_chars,
+            query_tool_max_cell_chars=config.query_tool_max_cell_chars,
+            query_tool_timeout_seconds=config.query_tool_timeout_seconds,
+        )
+        _thread_local.llm_client = client
+    return client
+
+
+def _process_example(
+    index: int,
+    example: BirdExample,
+    db_context: DatabaseContext,
+    config: RunConfig,
+    strategy: Any,
+    run_dir_name: str,
+) -> dict[str, Any]:
+    """Process a single example: generate SQL, execute, compare. Thread-safe."""
+    llm_client: OpenAICompatibleText2SQLClient | None = None
+    if strategy.requires_llm:
+        llm_client = _get_thread_llm_client(config)
+        llm_client.set_trace_context(
+            session_id=run_dir_name,
+            name=f"q{example.question_id}_{example.db_id}",
+            metadata={
+                "question_id": example.question_id,
+                "db_id": example.db_id,
+                "difficulty": example.difficulty,
+                "strategy": config.strategy_name,
+                "model": config.model,
+            },
+            tags=[config.strategy_name, example.db_id, example.difficulty],
+        )
+
+    generation = strategy.generate(
+        example=example,
+        db_context=db_context,
+        llm_client=llm_client,
+        include_evidence=config.include_evidence,
+    )
+
+    predicted_sql = generation.sql.strip()
+    if not predicted_sql:
+        prediction_exec = execute_sql(
+            db_path=db_context.db_path,
+            sql="SELECT 1 WHERE 0",
+            timeout_seconds=config.query_timeout_seconds,
+        )
+        prediction_exec.error = generation.error or "Empty SQL output"
+    else:
+        prediction_exec = execute_sql(
+            db_path=db_context.db_path,
+            sql=predicted_sql,
+            timeout_seconds=config.query_timeout_seconds,
+        )
+
+    gold_exec = execute_sql(
+        db_path=db_context.db_path,
+        sql=example.gold_sql,
+        timeout_seconds=config.query_timeout_seconds,
+    )
+
+    executable = prediction_exec.error is None
+
+    exact_match = bool(predicted_sql) and normalize_sql(predicted_sql) == normalize_sql(
+        example.gold_sql
+    )
+
+    exec_match = False
+    if prediction_exec.error is None and gold_exec.error is None:
+        exec_match = results_match(
+            pred_rows=prediction_exec.rows,
+            gold_rows=gold_exec.rows,
+            ordered=config.ordered_result_compare,
+            float_precision=config.float_precision,
+        )
+
+    return {
+        "index": index,
+        "question_id": example.question_id,
+        "db_id": example.db_id,
+        "difficulty": example.difficulty,
+        "question": example.question,
+        "evidence": example.evidence,
+        "gold_sql": example.gold_sql,
+        "predicted_sql": predicted_sql,
+        "strategy": config.strategy_name,
+        "model": config.model,
+        "raw_output": generation.raw_output,
+        "generation_error": generation.error,
+        "generation_latency_s": generation.latency_s,
+        "query_tool_calls": generation.query_tool_calls,
+        "prompt_tokens": generation.prompt_tokens,
+        "completion_tokens": generation.completion_tokens,
+        "total_tokens": generation.total_tokens,
+        "messages": generation.messages,
+        "prediction_exec_error": prediction_exec.error,
+        "gold_exec_error": gold_exec.error,
+        "prediction_exec_time_s": prediction_exec.elapsed_s,
+        "gold_exec_time_s": gold_exec.elapsed_s,
+        "prediction_row_count": len(prediction_exec.rows) if prediction_exec.error is None else None,
+        "gold_row_count": len(gold_exec.rows) if gold_exec.error is None else None,
+        "executable": executable,
+        "exact_match": exact_match,
+        "exec_match": exec_match,
+    }
+
+
 def run_experiment(config: RunConfig) -> dict[str, Any]:
     dataset_root = config.dataset_root
     examples = load_examples(dataset_root=dataset_root, split_file=config.split_file)
@@ -67,23 +212,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         raise ValueError("No examples selected. Check --db-id/--offset/--limit.")
 
     strategy = get_strategy(config.strategy_name)
-
-    llm_client: OpenAICompatibleText2SQLClient | None = None
-    if strategy.requires_llm:
-        llm_client = OpenAICompatibleText2SQLClient(
-            model=config.model,
-            api_base_url=config.api_base_url,
-            api_key=config.api_key,
-            reasoning_effort=config.reasoning_effort,
-            temperature=config.temperature,
-            max_output_tokens=config.max_output_tokens,
-            query_tool_enabled=config.query_tool_enabled,
-            query_tool_max_calls=config.query_tool_max_calls,
-            query_tool_max_rows=config.query_tool_max_rows,
-            query_tool_max_output_chars=config.query_tool_max_output_chars,
-            query_tool_max_cell_chars=config.query_tool_max_cell_chars,
-            query_tool_timeout_seconds=config.query_tool_timeout_seconds,
-        )
+    max_workers = max(1, config.max_workers)
 
     run_dir = _prepare_run_dir(
         output_root=config.output_root,
@@ -92,143 +221,82 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     )
 
     started_at = datetime.now().isoformat(timespec="seconds")
-
-    db_cache: dict[str, DatabaseContext] = {}
-    rows: list[dict[str, Any]] = []
-
-    exec_match_count = 0
-    exact_match_count = 0
-    executable_count = 0
-    generation_error_count = 0
-    gold_exec_error_count = 0
-    query_tool_calls_total = 0
-    prompt_tokens_total = 0
-    completion_tokens_total = 0
-
     total = len(examples)
 
-    for index, example in enumerate(examples, start=1):
-        if example.db_id not in db_cache:
-            db_cache[example.db_id] = load_database_context(
+    # --- Phase 1: Pre-load all database contexts in parallel ---
+    unique_db_ids = list({ex.db_id for ex in examples})
+    db_cache: dict[str, DatabaseContext] = {}
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(unique_db_ids))) as pool:
+        future_to_db_id = {
+            pool.submit(
+                load_database_context,
                 dataset_root=dataset_root,
-                db_id=example.db_id,
+                db_id=db_id,
                 sample_rows_per_table=config.schema_sample_rows,
                 max_columns_per_table=config.max_columns_per_table,
                 data_dictionary_mode=config.data_dictionary_mode,
                 data_dictionary_max_values=config.data_dictionary_max_values,
-            )
-        db_context = db_cache[example.db_id]
+            ): db_id
+            for db_id in unique_db_ids
+        }
+        for future in as_completed(future_to_db_id):
+            db_id = future_to_db_id[future]
+            db_cache[db_id] = future.result()
 
-        if llm_client is not None:
-            llm_client.set_trace_context(
-                session_id=run_dir.name,
-                name=f"q{example.question_id}_{example.db_id}",
-                metadata={
-                    "question_id": example.question_id,
-                    "db_id": example.db_id,
-                    "difficulty": example.difficulty,
-                    "strategy": config.strategy_name,
-                    "model": config.model,
-                },
-                tags=[config.strategy_name, example.db_id, example.difficulty],
-            )
+    print(f"Loaded {len(db_cache)} database context(s). Processing {total} examples with {max_workers} workers...")
 
-        generation = strategy.generate(
-            example=example,
-            db_context=db_context,
-            llm_client=llm_client,
-            include_evidence=config.include_evidence,
-        )
+    # --- Phase 2: Process examples in parallel ---
+    rows: list[dict[str, Any]] = []
+    completed_count = 0
+    exec_match_count = 0
+    executable_count = 0
+    progress_lock = threading.Lock()
 
-        predicted_sql = generation.sql.strip()
-        if not predicted_sql:
-            prediction_exec = execute_sql(
-                db_path=db_context.db_path,
-                sql="SELECT 1 WHERE 0",
-                timeout_seconds=config.query_timeout_seconds,
-            )
-            prediction_exec.error = generation.error or "Empty SQL output"
-        else:
-            prediction_exec = execute_sql(
-                db_path=db_context.db_path,
-                sql=predicted_sql,
-                timeout_seconds=config.query_timeout_seconds,
-            )
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_index = {
+            pool.submit(
+                _process_example,
+                index=i,
+                example=example,
+                db_context=db_cache[example.db_id],
+                config=config,
+                strategy=strategy,
+                run_dir_name=run_dir.name,
+            ): i
+            for i, example in enumerate(examples)
+        }
 
-        gold_exec = execute_sql(
-            db_path=db_context.db_path,
-            sql=example.gold_sql,
-            timeout_seconds=config.query_timeout_seconds,
-        )
+        for future in as_completed(future_to_index):
+            row = future.result()
+            with progress_lock:
+                rows.append(row)
+                completed_count += 1
+                if row["exec_match"]:
+                    exec_match_count += 1
+                if row["executable"]:
+                    executable_count += 1
+                if completed_count % config.progress_every == 0 or completed_count == total:
+                    current_exec_acc = exec_match_count / completed_count
+                    current_executable_rate = executable_count / completed_count
+                    print(
+                        f"[{completed_count}/{total}] exec_acc={current_exec_acc:.3f} executable={current_executable_rate:.3f}"
+                    )
 
-        executable = prediction_exec.error is None
-        if executable:
-            executable_count += 1
-
-        if generation.error:
-            generation_error_count += 1
-        query_tool_calls_total += generation.query_tool_calls
-        prompt_tokens_total += generation.prompt_tokens or 0
-        completion_tokens_total += generation.completion_tokens or 0
-
-        if gold_exec.error:
-            gold_exec_error_count += 1
-
-        exact_match = bool(predicted_sql) and normalize_sql(predicted_sql) == normalize_sql(example.gold_sql)
-        if exact_match:
-            exact_match_count += 1
-
-        exec_match = False
-        if prediction_exec.error is None and gold_exec.error is None:
-            exec_match = results_match(
-                pred_rows=prediction_exec.rows,
-                gold_rows=gold_exec.rows,
-                ordered=config.ordered_result_compare,
-                float_precision=config.float_precision,
-            )
-            if exec_match:
-                exec_match_count += 1
-
-        rows.append(
-            {
-                "index": index - 1,
-                "question_id": example.question_id,
-                "db_id": example.db_id,
-                "difficulty": example.difficulty,
-                "question": example.question,
-                "evidence": example.evidence,
-                "gold_sql": example.gold_sql,
-                "predicted_sql": predicted_sql,
-                "strategy": config.strategy_name,
-                "model": config.model,
-                "raw_output": generation.raw_output,
-                "generation_error": generation.error,
-                "generation_latency_s": generation.latency_s,
-                "query_tool_calls": generation.query_tool_calls,
-                "prompt_tokens": generation.prompt_tokens,
-                "completion_tokens": generation.completion_tokens,
-                "total_tokens": generation.total_tokens,
-                "messages": generation.messages,
-                "prediction_exec_error": prediction_exec.error,
-                "gold_exec_error": gold_exec.error,
-                "prediction_exec_time_s": prediction_exec.elapsed_s,
-                "gold_exec_time_s": gold_exec.elapsed_s,
-                "prediction_row_count": len(prediction_exec.rows) if prediction_exec.error is None else None,
-                "gold_row_count": len(gold_exec.rows) if gold_exec.error is None else None,
-                "executable": executable,
-                "exact_match": exact_match,
-                "exec_match": exec_match,
-            }
-        )
-
-        if index % config.progress_every == 0 or index == total:
-            current_exec_acc = exec_match_count / index
-            current_executable_rate = executable_count / index
-            print(
-                f"[{index}/{total}] exec_acc={current_exec_acc:.3f} executable={current_executable_rate:.3f}"
-            )
+    # Sort rows by original index for deterministic output
+    rows.sort(key=lambda r: r["index"])
 
     finished_at = datetime.now().isoformat(timespec="seconds")
+
+    # --- Aggregate metrics ---
+    exec_match_count = sum(1 for r in rows if r["exec_match"])
+    exact_match_count = sum(1 for r in rows if r["exact_match"])
+    executable_count = sum(1 for r in rows if r["executable"])
+    generation_error_count = sum(1 for r in rows if r["generation_error"])
+    gold_exec_error_count = sum(1 for r in rows if r["gold_exec_error"])
+    query_tool_calls_total = sum(r["query_tool_calls"] for r in rows)
+    prompt_tokens_total = sum(r["prompt_tokens"] or 0 for r in rows)
+    completion_tokens_total = sum(r["completion_tokens"] or 0 for r in rows)
 
     summary = {
         "started_at": started_at,
@@ -236,7 +304,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "strategy": config.strategy_name,
         "model": config.model,
         "num_examples": total,
-        "num_dbs": len({example.db_id for example in examples}),
+        "num_dbs": len(unique_db_ids),
         "num_executable_predictions": executable_count,
         "executable_rate": executable_count / total,
         "num_exec_matches": exec_match_count,
@@ -256,6 +324,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "invalid_sql_rate": 1.0 - (executable_count / total),
         "ordered_result_compare": config.ordered_result_compare,
         "float_precision": config.float_precision,
+        "max_workers": max_workers,
         "run_dir": str(run_dir),
         "predictions_path": str(run_dir / "predictions.jsonl"),
         "summary_path": str(run_dir / "summary.json"),
@@ -265,7 +334,13 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     _write_json(run_dir / "run_config.json", _config_to_dict(config))
     _write_jsonl(run_dir / "predictions.jsonl", rows)
 
-    if llm_client is not None:
-        llm_client.flush_traces()
+    # Flush Langfuse traces from all thread-local clients
+    if strategy.requires_llm:
+        try:
+            from langfuse import Langfuse
+
+            Langfuse().flush()
+        except Exception:
+            pass
 
     return summary

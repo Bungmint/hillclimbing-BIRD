@@ -4,6 +4,7 @@ Examples:
   modal run modal_app.py --model-preset qwen-8b --limit 200 --strategy single_shot
   modal run modal_app.py --model-preset qwen-30b --limit 100 --query-tool-max-calls 6
   modal run modal_app.py --model-preset qwen-8b --lora-adapter-path /adapters/your_grpo_adapter --limit 200
+  modal run modal_app.py --model-preset qwen-8b --temperature 0.6 --top-p 0.95
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import modal
 
@@ -22,6 +23,8 @@ DATASET_VOLUME_NAME = "bird-dev-20240627"
 OUTPUT_VOLUME_NAME = "bird-outputs"
 MODEL_CACHE_VOLUME_NAME = "hf-model-cache"
 ADAPTER_VOLUME_NAME = "bird-rl-adapters"
+VLLM_CACHE_VOLUME_NAME = "vllm-cache"
+FLASHINFER_CACHE_VOLUME_NAME = "flashinfer-cache"
 
 REMOTE_DATASET_ROOT = Path("/datasets/dev_20240627")
 REMOTE_OUTPUT_ROOT = Path("/outputs")
@@ -38,7 +41,8 @@ class ModelPreset:
     gpu: str
     tensor_parallel_size: int
     gpu_memory_utilization: float
-    max_model_len: int = 8192
+    max_model_len: int = 32768
+    is_moe: bool = False
 
 
 MODEL_PRESETS: dict[str, ModelPreset] = {
@@ -55,6 +59,7 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         gpu="B200",
         tensor_parallel_size=1,
         gpu_memory_utilization=0.92,
+        is_moe=True,
     ),
 }
 
@@ -66,7 +71,7 @@ def _build_vllm_command(
     lora_adapter_path: str | None,
     lora_adapter_name: str,
 ) -> list[str]:
-    return [
+    cmd = [
         "python",
         "-m",
         "vllm.entrypoints.openai.api_server",
@@ -87,11 +92,23 @@ def _build_vllm_command(
         "--api-key",
         VLLM_API_KEY,
         "--trust-remote-code",
-    ] + (
-        ["--enable-lora", "--lora-modules", f"{lora_adapter_name}={lora_adapter_path}"]
-        if lora_adapter_path
-        else []
-    )
+        # Qwen3 reasoning extraction is enabled by selecting a reasoning parser.
+        "--reasoning-parser",
+        "qwen3",
+        # Tool calling support for the query tool.
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes",
+    ]
+
+    # MoE models need expert parallelism when sharded across GPUs.
+    if preset.is_moe and preset.tensor_parallel_size > 1:
+        cmd += ["--enable-expert-parallel"]
+
+    if lora_adapter_path:
+        cmd += ["--enable-lora", "--lora-modules", f"{lora_adapter_name}={lora_adapter_path}"]
+
+    return cmd
 
 
 def _extract_served_model_ids(payload: dict) -> list[str]:
@@ -122,7 +139,9 @@ def _wait_for_server_ready(
         if process.poll() is not None:
             raise RuntimeError("vLLM server exited before becoming ready.")
         try:
-            with urlopen(models_url, timeout=3.0) as response:  # noqa: S310
+            req = Request(models_url)  # noqa: S310
+            req.add_header("Authorization", f"Bearer {VLLM_API_KEY}")
+            with urlopen(req, timeout=3.0) as response:  # noqa: S310
                 if response.status == 200:
                     payload = json.loads(response.read().decode("utf-8"))
                     served_model_ids = _extract_served_model_ids(payload)
@@ -204,6 +223,8 @@ def _run_experiment_with_vllm(
     model_id_override: str | None,
     lora_adapter_path: str | None,
     lora_adapter_name: str,
+    temperature: float = 0.6,
+    top_p: float | None = 0.95,
 ) -> dict:
     from bird_scaffold.runner import RunConfig, run_experiment
 
@@ -223,6 +244,8 @@ def _run_experiment_with_vllm(
             api_base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1",
             api_key=VLLM_API_KEY,
             reasoning_effort=None,
+            temperature=temperature,
+            top_p=top_p,
             limit=limit,
             offset=offset,
             db_id=db_id,
@@ -256,13 +279,17 @@ def _run_experiment_with_vllm(
 app = modal.App(APP_NAME)
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        add_python="3.11",
+    )
+    .entrypoint([])
     .add_local_dir("src", remote_path="/root/project/src", copy=True)
     .add_local_file("pyproject.toml", remote_path="/root/project/pyproject.toml", copy=True)
     .add_local_file("README.md", remote_path="/root/project/README.md", copy=True)
     .pip_install(
         "/root/project",
-        "vllm>=0.8.0",
+        "vllm>=0.9.0",
     )
 )
 
@@ -270,15 +297,24 @@ dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME, create_if_missing=T
 output_volume = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 model_cache_volume = modal.Volume.from_name(MODEL_CACHE_VOLUME_NAME, create_if_missing=True)
 adapter_volume = modal.Volume.from_name(ADAPTER_VOLUME_NAME, create_if_missing=True)
+vllm_cache_volume = modal.Volume.from_name(VLLM_CACHE_VOLUME_NAME, create_if_missing=True)
+flashinfer_cache_volume = modal.Volume.from_name(
+    FLASHINFER_CACHE_VOLUME_NAME, create_if_missing=True
+)
 
 COMMON_FUNCTION_ARGS: dict[str, object] = {
     "image": image,
     "timeout": 60 * 60 * 6,
+    "secrets": [
+        # modal.Secret.from_name("langfuse-credentials"),
+    ],
     "volumes": {
         "/datasets": dataset_volume,
         "/outputs": output_volume,
         "/adapters": adapter_volume,
         "/root/.cache/huggingface": model_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+        "/root/.cache/flashinfer": flashinfer_cache_volume,
     },
 }
 
@@ -291,8 +327,8 @@ def _remote_run(
     split_file: str = "dev.json",
     db_id: str | None = None,
     offset: int = 0,
-    no_evidence: bool = False,
-    data_dictionary_mode: str = "off",
+    no_evidence: bool = True,
+    data_dictionary_mode: str = "stats_and_samples",
     data_dictionary_max_values: int = 3,
     schema_sample_rows: int = 0,
     max_columns_per_table: int = 80,
@@ -307,6 +343,8 @@ def _remote_run(
     model_id_override: str | None = None,
     lora_adapter_path: str | None = None,
     lora_adapter_name: str = "sqlrl",
+    temperature: float = 0.6,
+    top_p: float | None = 0.95,
 ) -> dict:
     preset = MODEL_PRESETS[preset_name]
     return _run_experiment_with_vllm(
@@ -332,6 +370,8 @@ def _remote_run(
         model_id_override=model_id_override,
         lora_adapter_path=lora_adapter_path,
         lora_adapter_name=lora_adapter_name,
+        temperature=temperature,
+        top_p=top_p,
     )
 
 
@@ -342,8 +382,8 @@ def run_qwen_8b_remote(
     split_file: str = "dev.json",
     db_id: str | None = None,
     offset: int = 0,
-    no_evidence: bool = False,
-    data_dictionary_mode: str = "off",
+    no_evidence: bool = True,
+    data_dictionary_mode: str = "stats_and_samples",
     data_dictionary_max_values: int = 3,
     schema_sample_rows: int = 0,
     max_columns_per_table: int = 80,
@@ -358,6 +398,8 @@ def run_qwen_8b_remote(
     model_id_override: str | None = None,
     lora_adapter_path: str | None = None,
     lora_adapter_name: str = "sqlrl",
+    temperature: float = 0.6,
+    top_p: float | None = 0.95,
 ) -> dict:
     return _remote_run(
         "qwen-8b",
@@ -382,6 +424,8 @@ def run_qwen_8b_remote(
         model_id_override=model_id_override,
         lora_adapter_path=lora_adapter_path,
         lora_adapter_name=lora_adapter_name,
+        temperature=temperature,
+        top_p=top_p,
     )
 
 
@@ -392,8 +436,8 @@ def run_qwen_30b_remote(
     split_file: str = "dev.json",
     db_id: str | None = None,
     offset: int = 0,
-    no_evidence: bool = False,
-    data_dictionary_mode: str = "off",
+    no_evidence: bool = True,
+    data_dictionary_mode: str = "stats_and_samples",
     data_dictionary_max_values: int = 3,
     schema_sample_rows: int = 0,
     max_columns_per_table: int = 80,
@@ -408,6 +452,8 @@ def run_qwen_30b_remote(
     model_id_override: str | None = None,
     lora_adapter_path: str | None = None,
     lora_adapter_name: str = "sqlrl",
+    temperature: float = 0.6,
+    top_p: float | None = 0.95,
 ) -> dict:
     return _remote_run(
         "qwen-30b",
@@ -432,6 +478,8 @@ def run_qwen_30b_remote(
         model_id_override=model_id_override,
         lora_adapter_path=lora_adapter_path,
         lora_adapter_name=lora_adapter_name,
+        temperature=temperature,
+        top_p=top_p,
     )
 
 
@@ -443,8 +491,8 @@ def main(
     split_file: str = "dev.json",
     db_id: str | None = None,
     offset: int = 0,
-    no_evidence: bool = False,
-    data_dictionary_mode: str = "off",
+    no_evidence: bool = True,
+    data_dictionary_mode: str = "stats_and_samples",
     data_dictionary_max_values: int = 3,
     schema_sample_rows: int = 0,
     max_columns_per_table: int = 80,
@@ -459,6 +507,8 @@ def main(
     model_id_override: str | None = None,
     lora_adapter_path: str | None = None,
     lora_adapter_name: str = "sqlrl",
+    temperature: float = 0.6,
+    top_p: float = 0.95,
 ) -> None:
     if model_preset not in MODEL_PRESETS:
         supported = ", ".join(sorted(MODEL_PRESETS))
@@ -486,6 +536,8 @@ def main(
         "model_id_override": model_id_override,
         "lora_adapter_path": lora_adapter_path,
         "lora_adapter_name": lora_adapter_name,
+        "temperature": temperature,
+        "top_p": top_p,
     }
 
     if model_preset == "qwen-8b":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _CODE_BLOCK_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _READ_ONLY_PREFIXES = ("select", "with", "pragma", "explain")
 _MUTATING_KEYWORDS_RE = re.compile(
@@ -13,7 +14,7 @@ _LITERAL_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
 
 
 def extract_sql(text: str) -> str:
-    candidate = text.strip()
+    candidate = _THINK_RE.sub("", text).strip()
 
     code_match = _CODE_BLOCK_RE.search(candidate)
     if code_match:

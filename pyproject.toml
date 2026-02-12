@@ -22,6 +22,7 @@ rl = [
   "chz>=0.4.0",
   "tinker>=0.6.1",
   "tinker_cookbook>=0.1.0",
+  "wandb>=0.17.0",
 ]
 dev = [
   "pytest>=8.0.0",
@@ -30,6 +31,9 @@ dev = [
 
 [project.scripts]
 bird-scaffold = "bird_scaffold.cli:main"
+
+[tool.uv.sources]
+tinker_cookbook = { path = "tinker-cookbook", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
