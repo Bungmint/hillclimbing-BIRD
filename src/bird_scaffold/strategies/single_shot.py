@@ -22,7 +22,7 @@ class SingleShotStrategy(SQLGenerationStrategy):
         )
 
         try:
-            sql, raw_output, latency_s, query_tool_calls = llm_client.generate_sql(
+            sql, raw_output, latency_s, query_tool_calls, token_usage, messages = llm_client.generate_sql(
                 system_prompt=build_system_prompt(enable_query_tool=llm_client.query_tool_enabled),
                 user_prompt=user_prompt,
                 db_path=db_context.db_path,
@@ -32,6 +32,10 @@ class SingleShotStrategy(SQLGenerationStrategy):
                 raw_output=raw_output,
                 latency_s=latency_s,
                 query_tool_calls=query_tool_calls,
+                prompt_tokens=token_usage.get("prompt_tokens") or None,
+                completion_tokens=token_usage.get("completion_tokens") or None,
+                total_tokens=token_usage.get("total_tokens") or None,
+                messages=messages,
             )
         except Exception as exc:
             return GenerationResult(sql="", error=str(exc))

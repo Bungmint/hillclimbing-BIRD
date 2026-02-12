@@ -7,6 +7,7 @@ Local-first scaffold for BIRD-style text-to-SQL experiments on `dev_20240627`.
 - Baseline runner: `question -> OpenAI-compatible model (+ query tool calls) -> SQL -> execute -> evaluate`
 - Execution-accuracy style metrics against BIRD gold SQL
 - Strategy interface so you can add new ideas without changing the core loop
+- Tinker GRPO training entrypoint for trajectory-outcome rewards
 - Modal entrypoint reusing the same runner for larger experiments later
 
 ## Quick Start (MacBook local)
@@ -35,7 +36,7 @@ bird-scaffold preview --dataset-root dev_20240627
 ```bash
 bird-scaffold run \
   --dataset-root dev_20240627 \
-  --model Qwen/Qwen2.5-7B-Instruct \
+  --model Qwen/Qwen3-8B \
   --api-base-url http://127.0.0.1:8000/v1 \
   --api-key EMPTY \
   --strategy single_shot \
@@ -48,7 +49,7 @@ Run Idea 1A (schema + data dictionary) with the same baseline strategy:
 ```bash
 bird-scaffold run \
   --dataset-root dev_20240627 \
-  --model Qwen/Qwen2.5-7B-Instruct \
+  --model Qwen/Qwen3-8B \
   --api-base-url http://127.0.0.1:8000/v1 \
   --api-key EMPTY \
   --strategy single_shot \
@@ -76,6 +77,7 @@ Outputs are written to `outputs/<timestamp>_<strategy>_<model>/` with:
 ```bash
 bird-scaffold strategies
 bird-scaffold show-schema --dataset-root dev_20240627 --db-id financial
+bird-scaffold rl-train --help
 ```
 
 ## Extend with new project ideas
@@ -119,11 +121,50 @@ This is designed for direct ablations without changing strategy code.
 
 Supported presets:
 
-- `qwen-8b` -> `Qwen/Qwen2.5-7B-Instruct`
-- `qwen-30b` -> `Qwen/Qwen2.5-32B-Instruct`
+- `qwen-8b` -> `Qwen/Qwen3-8B`
+- `qwen-30b` -> `Qwen/Qwen3-30B-A3B`
 
 Example:
 
 ```bash
 modal run modal_app.py --model-preset qwen-8b --limit 200 --strategy single_shot
 ```
+
+You can also serve a fine-tuned checkpoint/adapter:
+
+```bash
+modal run modal_app.py \
+  --model-preset qwen-8b \
+  --model-id-override Qwen/Qwen3-8B \
+  --lora-adapter-path /adapters/your_grpo_adapter \
+  --lora-adapter-name bird-grpo \
+  --limit 200 \
+  --strategy single_shot
+```
+
+## Tinker GRPO (Trajectory Outcome Reward)
+
+Install RL dependencies first:
+
+```bash
+uv pip install tinker tinker_cookbook chz
+```
+
+Run vanilla GRPO with execution-outcome reward (default model is `Qwen/Qwen3-8B`):
+
+```bash
+bird-scaffold rl-train \
+  --dataset-root dev_20240627 \
+  --split-file dev.json \
+  --model Qwen/Qwen3-8B \
+  --group-size 8 \
+  --groups-per-batch 16 \
+  --train-limit 256 \
+  --eval-limit 64 \
+  --reward-exec-match 1.0 \
+  --reward-executable 0.0 \
+  --reward-exact-sql 0.0
+```
+
+Training logs/checkpoint metadata are written under `outputs/tinker_grpo/...`.
+Use the saved adapter/checkpoint from that run for Modal serving and eval.

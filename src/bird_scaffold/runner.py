@@ -102,6 +102,8 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     generation_error_count = 0
     gold_exec_error_count = 0
     query_tool_calls_total = 0
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
 
     total = len(examples)
 
@@ -116,6 +118,20 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
                 data_dictionary_max_values=config.data_dictionary_max_values,
             )
         db_context = db_cache[example.db_id]
+
+        if llm_client is not None:
+            llm_client.set_trace_context(
+                session_id=run_dir.name,
+                name=f"q{example.question_id}_{example.db_id}",
+                metadata={
+                    "question_id": example.question_id,
+                    "db_id": example.db_id,
+                    "difficulty": example.difficulty,
+                    "strategy": config.strategy_name,
+                    "model": config.model,
+                },
+                tags=[config.strategy_name, example.db_id, example.difficulty],
+            )
 
         generation = strategy.generate(
             example=example,
@@ -152,6 +168,8 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         if generation.error:
             generation_error_count += 1
         query_tool_calls_total += generation.query_tool_calls
+        prompt_tokens_total += generation.prompt_tokens or 0
+        completion_tokens_total += generation.completion_tokens or 0
 
         if gold_exec.error:
             gold_exec_error_count += 1
@@ -183,9 +201,14 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
                 "predicted_sql": predicted_sql,
                 "strategy": config.strategy_name,
                 "model": config.model,
+                "raw_output": generation.raw_output,
                 "generation_error": generation.error,
                 "generation_latency_s": generation.latency_s,
                 "query_tool_calls": generation.query_tool_calls,
+                "prompt_tokens": generation.prompt_tokens,
+                "completion_tokens": generation.completion_tokens,
+                "total_tokens": generation.total_tokens,
+                "messages": generation.messages,
                 "prediction_exec_error": prediction_exec.error,
                 "gold_exec_error": gold_exec.error,
                 "prediction_exec_time_s": prediction_exec.elapsed_s,
@@ -224,6 +247,12 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "num_gold_exec_errors": gold_exec_error_count,
         "num_query_tool_calls": query_tool_calls_total,
         "avg_query_tool_calls_per_example": query_tool_calls_total / total,
+        "total_prompt_tokens": prompt_tokens_total,
+        "total_completion_tokens": completion_tokens_total,
+        "total_tokens": prompt_tokens_total + completion_tokens_total,
+        "avg_prompt_tokens_per_example": prompt_tokens_total / total,
+        "avg_completion_tokens_per_example": completion_tokens_total / total,
+        "avg_total_tokens_per_example": (prompt_tokens_total + completion_tokens_total) / total,
         "invalid_sql_rate": 1.0 - (executable_count / total),
         "ordered_result_compare": config.ordered_result_compare,
         "float_precision": config.float_precision,
@@ -235,5 +264,8 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     _write_json(run_dir / "summary.json", summary)
     _write_json(run_dir / "run_config.json", _config_to_dict(config))
     _write_jsonl(run_dir / "predictions.jsonl", rows)
+
+    if llm_client is not None:
+        llm_client.flush_traces()
 
     return summary

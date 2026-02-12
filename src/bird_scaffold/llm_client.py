@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from langfuse.openai import OpenAI
 
 from bird_scaffold.query_tool import (
     QUERY_TOOL_NAME,
@@ -64,13 +65,24 @@ class OpenAICompatibleText2SQLClient:
         ).validated()
 
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base_url)
+        self._trace_context: dict[str, Any] = {}
+
+    def set_trace_context(self, **kwargs: Any) -> None:
+        """Set Langfuse trace metadata for subsequent generate_sql calls."""
+        self._trace_context = {k: v for k, v in kwargs.items() if v is not None}
+
+    def flush_traces(self) -> None:
+        self._client.flush()
 
     def generate_sql(
         self,
         system_prompt: str,
         user_prompt: str,
         db_path: Path | None = None,
-    ) -> tuple[str, str, float, int]:
+    ) -> tuple[str, str, float, int, dict[str, int], list[dict[str, Any]]]:
+        """Returns (sql, raw_text, elapsed, query_tool_calls, token_usage, messages)."""
+        # One trace_id groups all tool-calling rounds for this generation.
+        self._active_trace_id = str(uuid.uuid4())
         started = time.perf_counter()
         query_tool_executor = self._build_query_tool_executor(db_path=db_path)
         tools = [build_query_tool_schema()] if query_tool_executor is not None else None
@@ -84,6 +96,8 @@ class OpenAICompatibleText2SQLClient:
         raw_text = ""
         tool_rounds = 0
         max_tool_rounds = self.query_tool_config.max_calls + 4
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
 
         while True:
             try:
@@ -95,6 +109,10 @@ class OpenAICompatibleText2SQLClient:
                     response = self._create_completion(messages=messages, tools=None)
                 else:
                     raise
+
+            usage = _extract_usage(response)
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
 
             assistant_message = _extract_assistant_message(response)
             raw_text = _extract_message_text(assistant_message)
@@ -132,7 +150,12 @@ class OpenAICompatibleText2SQLClient:
 
         elapsed = time.perf_counter() - started
         sql = _extract_sql(raw_text)
-        return sql, raw_text, elapsed, query_tool_calls
+        token_usage = {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+        }
+        return sql, raw_text, elapsed, query_tool_calls, token_usage, messages
 
     def _build_query_tool_executor(self, db_path: Path | None) -> QueryToolExecutor | None:
         if not self.query_tool_enabled:
@@ -160,11 +183,19 @@ class OpenAICompatibleText2SQLClient:
         if self.reasoning_effort and _looks_like_openai_base_url(self.api_base_url):
             kwargs["reasoning_effort"] = self.reasoning_effort
 
+        # Langfuse trace context — stripped by the wrapper before hitting the API.
+        if self._trace_context:
+            kwargs.update(self._trace_context)
+        kwargs["trace_id"] = self._active_trace_id
+
         try:
             return self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             if "reasoning_effort" in kwargs and _is_reasoning_parameter_error(exc):
                 kwargs.pop("reasoning_effort", None)
+                return self._client.chat.completions.create(**kwargs)
+            if "max_tokens" in kwargs and _is_max_tokens_unsupported_error(exc):
+                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
                 return self._client.chat.completions.create(**kwargs)
             raise
 
@@ -197,6 +228,16 @@ def _normalize_base_url(base_url: str | None) -> str | None:
     if normalized.endswith("/v1"):
         return normalized
     return normalized + "/v1"
+
+
+def _extract_usage(response: Any) -> dict[str, int]:
+    usage = _get(response, "usage")
+    if usage is None:
+        return {}
+    return {
+        "prompt_tokens": int(_get(usage, "prompt_tokens") or 0),
+        "completion_tokens": int(_get(usage, "completion_tokens") or 0),
+    }
 
 
 def _extract_assistant_message(response: Any) -> Any:
@@ -316,3 +357,8 @@ def _is_tool_calling_unsupported_error(exc: Exception) -> bool:
 def _is_reasoning_parameter_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "reasoning_effort" in text and ("unknown" in text or "unsupported" in text or "extra" in text)
+
+
+def _is_max_tokens_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "max_tokens" in text and ("unsupported" in text or "not supported" in text)

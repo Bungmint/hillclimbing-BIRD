@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--offset", type=int, default=0)
     run.add_argument("--limit", type=int, default=None)
     run.add_argument("--strategy", default="single_shot")
-    run.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    run.add_argument("--model", default="Qwen/Qwen3-8B")
     run.add_argument(
         "--api-base-url",
         default=None,
@@ -89,6 +89,60 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--query-tool-timeout", type=float, default=8.0)
     run.add_argument("--progress-every", type=int, default=10)
     run.add_argument("--output-root", default="outputs")
+
+    rl_train = subparsers.add_parser("rl-train", help="Run Tinker GRPO training on BIRD")
+    rl_train.add_argument("--dataset-root", default="dev_20240627")
+    rl_train.add_argument("--split-file", default="dev.json")
+    rl_train.add_argument("--db-id", default=None)
+    rl_train.add_argument("--model", default="Qwen/Qwen3-8B")
+    rl_train.add_argument("--renderer-name", default=None)
+    rl_train.add_argument("--train-offset", type=int, default=0)
+    rl_train.add_argument("--train-limit", type=int, default=256)
+    rl_train.add_argument("--eval-offset", type=int, default=None)
+    rl_train.add_argument("--eval-limit", type=int, default=64)
+    rl_train.add_argument("--no-shuffle", action="store_true")
+    rl_train.add_argument("--seed", type=int, default=0)
+    rl_train.add_argument("--no-evidence", action="store_true")
+    rl_train.add_argument(
+        "--data-dictionary-mode",
+        choices=[DATA_DICTIONARY_MODE_OFF, DATA_DICTIONARY_MODE_STATS, DATA_DICTIONARY_MODE_STATS_AND_SAMPLES],
+        default=DATA_DICTIONARY_MODE_OFF,
+    )
+    rl_train.add_argument("--data-dictionary-max-values", type=int, default=3)
+    rl_train.add_argument("--schema-sample-rows", type=int, default=0)
+    rl_train.add_argument("--max-columns", type=int, default=80)
+    rl_train.add_argument("--query-timeout", type=float, default=20.0)
+    rl_train.add_argument("--ordered", action="store_true")
+    rl_train.add_argument("--float-precision", type=int, default=6)
+    rl_train.add_argument("--group-size", type=int, default=8)
+    rl_train.add_argument("--groups-per-batch", type=int, default=16)
+    rl_train.add_argument("--learning-rate", type=float, default=1e-5)
+    rl_train.add_argument("--max-tokens", type=int, default=512)
+    rl_train.add_argument("--temperature", type=float, default=1.0)
+    rl_train.add_argument("--lora-rank", type=int, default=32)
+    rl_train.add_argument("--kl-penalty-coef", type=float, default=0.0)
+    rl_train.add_argument("--num-substeps", type=int, default=1)
+    rl_train.add_argument(
+        "--loss-fn",
+        choices=["importance_sampling", "ppo"],
+        default="importance_sampling",
+    )
+    rl_train.add_argument("--max-steps-off-policy", type=int, default=None)
+    rl_train.add_argument("--reward-exec-match", type=float, default=1.0)
+    rl_train.add_argument("--reward-executable", type=float, default=0.0)
+    rl_train.add_argument("--reward-exact-sql", type=float, default=0.0)
+    rl_train.add_argument("--eval-every", type=int, default=20)
+    rl_train.add_argument("--save-every", type=int, default=20)
+    rl_train.add_argument("--log-path", default=None)
+    rl_train.add_argument("--load-checkpoint-path", default=None)
+    rl_train.add_argument("--base-url", default=None)
+    rl_train.add_argument("--wandb-project", default=None)
+    rl_train.add_argument("--wandb-name", default=None)
+    rl_train.add_argument(
+        "--behavior-if-log-dir-exists",
+        choices=["ask", "error", "overwrite"],
+        default="ask",
+    )
 
     return parser
 
@@ -173,6 +227,62 @@ def _cmd_run(args: argparse.Namespace) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def _cmd_rl_train(args: argparse.Namespace) -> None:
+    try:
+        from bird_scaffold.tinker_grpo import TinkerGRPOConfig, run_tinker_grpo_training
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tinker RL dependencies are missing. Install them first (for example: "
+            "`uv sync --extra rl` or `uv pip install tinker tinker_cookbook chz`)."
+        ) from exc
+
+    config = TinkerGRPOConfig(
+        dataset_root=Path(args.dataset_root),
+        split_file=args.split_file,
+        model=args.model,
+        renderer_name=args.renderer_name,
+        db_id=args.db_id,
+        train_offset=args.train_offset,
+        train_limit=args.train_limit,
+        eval_offset=args.eval_offset,
+        eval_limit=args.eval_limit,
+        shuffle=not args.no_shuffle,
+        seed=args.seed,
+        include_evidence=not args.no_evidence,
+        data_dictionary_mode=args.data_dictionary_mode,
+        data_dictionary_max_values=args.data_dictionary_max_values,
+        schema_sample_rows=args.schema_sample_rows,
+        max_columns_per_table=args.max_columns,
+        query_timeout_seconds=args.query_timeout,
+        ordered_result_compare=args.ordered,
+        float_precision=args.float_precision,
+        group_size=args.group_size,
+        groups_per_batch=args.groups_per_batch,
+        learning_rate=args.learning_rate,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        lora_rank=args.lora_rank,
+        kl_penalty_coef=args.kl_penalty_coef,
+        num_substeps=args.num_substeps,
+        loss_fn=args.loss_fn,
+        max_steps_off_policy=args.max_steps_off_policy,
+        reward_exec_match=args.reward_exec_match,
+        reward_executable=args.reward_executable,
+        reward_exact_sql=args.reward_exact_sql,
+        eval_every=args.eval_every,
+        save_every=args.save_every,
+        log_path=Path(args.log_path) if args.log_path else None,
+        load_checkpoint_path=args.load_checkpoint_path,
+        base_url=args.base_url,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+        behavior_if_log_dir_exists=args.behavior_if_log_dir_exists,
+    )
+
+    summary = run_tinker_grpo_training(config)
+    print(json.dumps(summary, indent=2))
+
+
 def main() -> None:
     load_dotenv()
     parser = _build_parser()
@@ -199,6 +309,10 @@ def main() -> None:
 
         if args.command == "run":
             _cmd_run(args)
+            return
+
+        if args.command == "rl-train":
+            _cmd_rl_train(args)
             return
 
         raise ValueError(f"Unsupported command: {args.command}")

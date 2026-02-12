@@ -50,6 +50,10 @@ class GenerationResult:
     error: str | None = None
     latency_s: float | None = None
     query_tool_calls: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    messages: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -57,7 +61,7 @@ class RunConfig:
     dataset_root: Path
     split_file: str = "dev.json"
     strategy_name: str = "single_shot"
-    model: str = "Qwen/Qwen2.5-7B-Instruct"
+    model: str = "Qwen/Qwen3-8B"
     api_base_url: str | None = None
     api_key: str | None = None
     reasoning_effort: str | None = "high"

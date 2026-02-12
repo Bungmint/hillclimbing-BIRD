@@ -1,8 +1,9 @@
-"""Modal entrypoint for running BIRD experiments on top of vLLM (Qwen 8B/30B).
+"""Modal entrypoint for running BIRD experiments on top of vLLM (Qwen3 8B/30B-A3B).
 
 Examples:
   modal run modal_app.py --model-preset qwen-8b --limit 200 --strategy single_shot
   modal run modal_app.py --model-preset qwen-30b --limit 100 --query-tool-max-calls 6
+  modal run modal_app.py --model-preset qwen-8b --lora-adapter-path /adapters/your_grpo_adapter --limit 200
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ APP_NAME = "bird-scaffold-vllm"
 DATASET_VOLUME_NAME = "bird-dev-20240627"
 OUTPUT_VOLUME_NAME = "bird-outputs"
 MODEL_CACHE_VOLUME_NAME = "hf-model-cache"
+ADAPTER_VOLUME_NAME = "bird-rl-adapters"
 
 REMOTE_DATASET_ROOT = Path("/datasets/dev_20240627")
 REMOTE_OUTPUT_ROOT = Path("/outputs")
@@ -42,14 +44,14 @@ class ModelPreset:
 MODEL_PRESETS: dict[str, ModelPreset] = {
     "qwen-8b": ModelPreset(
         name="qwen-8b",
-        model_id="Qwen/Qwen2.5-7B-Instruct",
+        model_id="Qwen/Qwen3-8B",
         gpu="B200",
         tensor_parallel_size=1,
         gpu_memory_utilization=0.92,
     ),
     "qwen-30b": ModelPreset(
         name="qwen-30b",
-        model_id="Qwen/Qwen2.5-32B-Instruct",
+        model_id="Qwen/Qwen3-30B-A3B",
         gpu="B200",
         tensor_parallel_size=1,
         gpu_memory_utilization=0.92,
@@ -57,7 +59,13 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
 }
 
 
-def _build_vllm_command(preset: ModelPreset) -> list[str]:
+def _build_vllm_command(
+    preset: ModelPreset,
+    *,
+    model_id: str,
+    lora_adapter_path: str | None,
+    lora_adapter_name: str,
+) -> list[str]:
     return [
         "python",
         "-m",
@@ -67,7 +75,9 @@ def _build_vllm_command(preset: ModelPreset) -> list[str]:
         "--port",
         str(VLLM_PORT),
         "--model",
-        preset.model_id,
+        model_id,
+        "--served-model-name",
+        model_id,
         "--tensor-parallel-size",
         str(preset.tensor_parallel_size),
         "--gpu-memory-utilization",
@@ -77,10 +87,34 @@ def _build_vllm_command(preset: ModelPreset) -> list[str]:
         "--api-key",
         VLLM_API_KEY,
         "--trust-remote-code",
-    ]
+    ] + (
+        ["--enable-lora", "--lora-modules", f"{lora_adapter_name}={lora_adapter_path}"]
+        if lora_adapter_path
+        else []
+    )
 
 
-def _wait_for_server_ready(base_url: str, process: subprocess.Popen[str], timeout_seconds: float = 900.0) -> None:
+def _extract_served_model_ids(payload: dict) -> list[str]:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = row.get("id")
+        if isinstance(model_id, str) and model_id:
+            ids.append(model_id)
+    return ids
+
+
+def _wait_for_server_ready(
+    base_url: str,
+    process: subprocess.Popen[str],
+    *,
+    requested_model_id: str,
+    timeout_seconds: float = 900.0,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
     models_url = f"{base_url}/models"
 
@@ -90,7 +124,13 @@ def _wait_for_server_ready(base_url: str, process: subprocess.Popen[str], timeou
         try:
             with urlopen(models_url, timeout=3.0) as response:  # noqa: S310
                 if response.status == 200:
-                    return
+                    payload = json.loads(response.read().decode("utf-8"))
+                    served_model_ids = _extract_served_model_ids(payload)
+                    if requested_model_id in served_model_ids:
+                        return requested_model_id
+                    if served_model_ids:
+                        return served_model_ids[0]
+                    return requested_model_id
         except Exception:
             time.sleep(2.0)
             continue
@@ -98,8 +138,19 @@ def _wait_for_server_ready(base_url: str, process: subprocess.Popen[str], timeou
     raise TimeoutError(f"Timed out waiting for vLLM readiness at {models_url}.")
 
 
-def _start_vllm_server(preset: ModelPreset) -> subprocess.Popen[str]:
-    command = _build_vllm_command(preset)
+def _start_vllm_server(
+    preset: ModelPreset,
+    *,
+    model_id: str,
+    lora_adapter_path: str | None,
+    lora_adapter_name: str,
+) -> tuple[subprocess.Popen[str], str]:
+    command = _build_vllm_command(
+        preset,
+        model_id=model_id,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
+    )
     process = subprocess.Popen(
         command,
         stdout=None,
@@ -107,8 +158,12 @@ def _start_vllm_server(preset: ModelPreset) -> subprocess.Popen[str]:
         text=False,
     )
     try:
-        _wait_for_server_ready(base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1", process=process)
-        return process
+        served_model_id = _wait_for_server_ready(
+            base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1",
+            process=process,
+            requested_model_id=model_id,
+        )
+        return process, served_model_id
     except Exception:
         _stop_vllm_server(process)
         raise
@@ -146,16 +201,25 @@ def _run_experiment_with_vllm(
     query_tool_max_output_chars: int,
     query_tool_max_cell_chars: int,
     query_tool_timeout_seconds: float,
+    model_id_override: str | None,
+    lora_adapter_path: str | None,
+    lora_adapter_name: str,
 ) -> dict:
     from bird_scaffold.runner import RunConfig, run_experiment
 
-    process = _start_vllm_server(preset)
+    resolved_model_id = model_id_override or preset.model_id
+    process, served_model_id = _start_vllm_server(
+        preset,
+        model_id=resolved_model_id,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
+    )
     try:
         config = RunConfig(
             dataset_root=REMOTE_DATASET_ROOT,
             split_file=split_file,
             strategy_name=strategy,
-            model=preset.model_id,
+            model=served_model_id,
             api_base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1",
             api_key=VLLM_API_KEY,
             reasoning_effort=None,
@@ -179,7 +243,10 @@ def _run_experiment_with_vllm(
         )
         summary = run_experiment(config)
         summary["model_preset"] = preset.name
-        summary["vllm_model"] = preset.model_id
+        summary["requested_model_id"] = resolved_model_id
+        summary["served_model_id"] = served_model_id
+        summary["lora_adapter_path"] = lora_adapter_path
+        summary["lora_adapter_name"] = lora_adapter_name if lora_adapter_path else None
         summary["vllm_base_url"] = config.api_base_url
         return summary
     finally:
@@ -195,13 +262,14 @@ image = (
     .add_local_file("README.md", remote_path="/root/project/README.md", copy=True)
     .pip_install(
         "/root/project",
-        "vllm==0.6.6.post1",
+        "vllm>=0.8.0",
     )
 )
 
 dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME, create_if_missing=True)
 output_volume = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
 model_cache_volume = modal.Volume.from_name(MODEL_CACHE_VOLUME_NAME, create_if_missing=True)
+adapter_volume = modal.Volume.from_name(ADAPTER_VOLUME_NAME, create_if_missing=True)
 
 COMMON_FUNCTION_ARGS: dict[str, object] = {
     "image": image,
@@ -209,6 +277,7 @@ COMMON_FUNCTION_ARGS: dict[str, object] = {
     "volumes": {
         "/datasets": dataset_volume,
         "/outputs": output_volume,
+        "/adapters": adapter_volume,
         "/root/.cache/huggingface": model_cache_volume,
     },
 }
@@ -235,6 +304,9 @@ def _remote_run(
     query_tool_max_output_chars: int = 6000,
     query_tool_max_cell_chars: int = 200,
     query_tool_timeout_seconds: float = 8.0,
+    model_id_override: str | None = None,
+    lora_adapter_path: str | None = None,
+    lora_adapter_name: str = "sqlrl",
 ) -> dict:
     preset = MODEL_PRESETS[preset_name]
     return _run_experiment_with_vllm(
@@ -257,6 +329,9 @@ def _remote_run(
         query_tool_max_output_chars=query_tool_max_output_chars,
         query_tool_max_cell_chars=query_tool_max_cell_chars,
         query_tool_timeout_seconds=query_tool_timeout_seconds,
+        model_id_override=model_id_override,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
     )
 
 
@@ -280,6 +355,9 @@ def run_qwen_8b_remote(
     query_tool_max_output_chars: int = 6000,
     query_tool_max_cell_chars: int = 200,
     query_tool_timeout_seconds: float = 8.0,
+    model_id_override: str | None = None,
+    lora_adapter_path: str | None = None,
+    lora_adapter_name: str = "sqlrl",
 ) -> dict:
     return _remote_run(
         "qwen-8b",
@@ -301,6 +379,9 @@ def run_qwen_8b_remote(
         query_tool_max_output_chars=query_tool_max_output_chars,
         query_tool_max_cell_chars=query_tool_max_cell_chars,
         query_tool_timeout_seconds=query_tool_timeout_seconds,
+        model_id_override=model_id_override,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
     )
 
 
@@ -324,6 +405,9 @@ def run_qwen_30b_remote(
     query_tool_max_output_chars: int = 6000,
     query_tool_max_cell_chars: int = 200,
     query_tool_timeout_seconds: float = 8.0,
+    model_id_override: str | None = None,
+    lora_adapter_path: str | None = None,
+    lora_adapter_name: str = "sqlrl",
 ) -> dict:
     return _remote_run(
         "qwen-30b",
@@ -345,6 +429,9 @@ def run_qwen_30b_remote(
         query_tool_max_output_chars=query_tool_max_output_chars,
         query_tool_max_cell_chars=query_tool_max_cell_chars,
         query_tool_timeout_seconds=query_tool_timeout_seconds,
+        model_id_override=model_id_override,
+        lora_adapter_path=lora_adapter_path,
+        lora_adapter_name=lora_adapter_name,
     )
 
 
@@ -369,6 +456,9 @@ def main(
     query_tool_max_output_chars: int = 6000,
     query_tool_max_cell_chars: int = 200,
     query_tool_timeout_seconds: float = 8.0,
+    model_id_override: str | None = None,
+    lora_adapter_path: str | None = None,
+    lora_adapter_name: str = "sqlrl",
 ) -> None:
     if model_preset not in MODEL_PRESETS:
         supported = ", ".join(sorted(MODEL_PRESETS))
@@ -393,6 +483,9 @@ def main(
         "query_tool_max_output_chars": query_tool_max_output_chars,
         "query_tool_max_cell_chars": query_tool_max_cell_chars,
         "query_tool_timeout_seconds": query_tool_timeout_seconds,
+        "model_id_override": model_id_override,
+        "lora_adapter_path": lora_adapter_path,
+        "lora_adapter_name": lora_adapter_name,
     }
 
     if model_preset == "qwen-8b":
