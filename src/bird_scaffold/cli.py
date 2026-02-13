@@ -70,6 +70,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Reasoning effort (OpenAI models only). Use 'off' to disable.",
     )
     run.add_argument("--temperature", type=float, default=0.0)
+    run.add_argument(
+        "--self-consistency-samples",
+        type=int,
+        default=1,
+        help="Number of sampled generations per question; final prediction is chosen by majority vote on execution result.",
+    )
     run.add_argument("--max-output-tokens", type=int, default=4096)
     run.add_argument("--evidence", action="store_true")
     run.add_argument("--ordered", action="store_true")
@@ -203,6 +209,9 @@ def _cmd_strategies() -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
+    if args.self_consistency_samples < 1:
+        raise ValueError("--self-consistency-samples must be >= 1")
+
     api_base_url = args.api_base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("VLLM_BASE_URL")
     api_key = args.api_key or os.getenv("OPENAI_API_KEY") or os.getenv("VLLM_API_KEY")
 
@@ -215,6 +224,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         api_key=api_key,
         reasoning_effort=None if args.reasoning_effort == "off" else args.reasoning_effort,
         temperature=args.temperature,
+        self_consistency_samples=args.self_consistency_samples,
         max_output_tokens=args.max_output_tokens,
         limit=args.limit,
         offset=args.offset,

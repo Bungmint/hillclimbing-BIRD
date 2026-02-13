@@ -232,8 +232,12 @@ def _run_experiment_with_vllm(
     lora_adapter_name: str,
     temperature: float = 0.6,
     top_p: float | None = 0.95,
+    self_consistency_samples: int = 1,
 ) -> dict:
     from bird_scaffold.runner import RunConfig, run_experiment
+
+    if self_consistency_samples < 1:
+        raise ValueError("--self-consistency-samples must be >= 1")
 
     resolved_model_id = model_id_override or preset.model_id
     process, served_model_id = _start_vllm_server(
@@ -253,6 +257,7 @@ def _run_experiment_with_vllm(
             reasoning_effort=None,
             temperature=temperature,
             top_p=top_p,
+            self_consistency_samples=self_consistency_samples,
             limit=limit,
             offset=offset,
             db_id=db_id,
@@ -352,6 +357,7 @@ def _remote_run(
     lora_adapter_name: str = "sqlrl",
     temperature: float = 0.6,
     top_p: float | None = 0.95,
+    self_consistency_samples: int = 1,
 ) -> dict:
     preset = MODEL_PRESETS[preset_name]
     return _run_experiment_with_vllm(
@@ -379,6 +385,7 @@ def _remote_run(
         lora_adapter_name=lora_adapter_name,
         temperature=temperature,
         top_p=top_p,
+        self_consistency_samples=self_consistency_samples,
     )
 
 
@@ -407,6 +414,7 @@ def run_qwen_8b_remote(
     lora_adapter_name: str = "sqlrl",
     temperature: float = 0.6,
     top_p: float | None = 0.95,
+    self_consistency_samples: int = 1,
 ) -> dict:
     return _remote_run(
         "qwen-8b",
@@ -433,6 +441,7 @@ def run_qwen_8b_remote(
         lora_adapter_name=lora_adapter_name,
         temperature=temperature,
         top_p=top_p,
+        self_consistency_samples=self_consistency_samples,
     )
 
 
@@ -461,6 +470,7 @@ def run_qwen_30b_remote(
     lora_adapter_name: str = "sqlrl",
     temperature: float = 0.6,
     top_p: float | None = 0.95,
+    self_consistency_samples: int = 1,
 ) -> dict:
     return _remote_run(
         "qwen-30b",
@@ -487,6 +497,7 @@ def run_qwen_30b_remote(
         lora_adapter_name=lora_adapter_name,
         temperature=temperature,
         top_p=top_p,
+        self_consistency_samples=self_consistency_samples,
     )
 
 
@@ -515,6 +526,7 @@ def run_qwen_32b_remote(
     lora_adapter_name: str = "sqlrl",
     temperature: float = 0.6,
     top_p: float | None = 0.95,
+    self_consistency_samples: int = 1,
 ) -> dict:
     return _remote_run(
         "qwen-32b",
@@ -541,6 +553,7 @@ def run_qwen_32b_remote(
         lora_adapter_name=lora_adapter_name,
         temperature=temperature,
         top_p=top_p,
+        self_consistency_samples=self_consistency_samples,
     )
 
 
@@ -570,10 +583,13 @@ def main(
     lora_adapter_name: str = "sqlrl",
     temperature: float = 0.6,
     top_p: float = 0.95,
+    self_consistency_samples: int = 1,
 ) -> None:
     if model_preset not in MODEL_PRESETS:
         supported = ", ".join(sorted(MODEL_PRESETS))
         raise ValueError(f"Unsupported --model-preset '{model_preset}'. Supported presets: {supported}")
+    if self_consistency_samples < 1:
+        raise ValueError("--self-consistency-samples must be >= 1")
 
     kwargs = {
         "limit": limit,
@@ -599,6 +615,7 @@ def main(
         "lora_adapter_name": lora_adapter_name,
         "temperature": temperature,
         "top_p": top_p,
+        "self_consistency_samples": self_consistency_samples,
     }
 
     remote_fn = {

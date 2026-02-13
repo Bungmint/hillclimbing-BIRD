@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
@@ -10,7 +11,7 @@ from typing import Any
 
 from bird_scaffold.dataset import filter_examples, load_examples
 from bird_scaffold.db import load_database_context
-from bird_scaffold.execution import execute_sql, normalize_sql, results_match
+from bird_scaffold.execution import canonicalize_rows, execute_sql, normalize_sql, results_match
 from bird_scaffold.llm_client import OpenAICompatibleText2SQLClient
 from bird_scaffold.strategies import get_strategy
 from bird_scaffold.types import BirdExample, DatabaseContext, RunConfig
@@ -99,6 +100,76 @@ def _get_thread_llm_client(config: RunConfig) -> OpenAICompatibleText2SQLClient:
     return client
 
 
+def _set_trace_context_for_sample(
+    *,
+    llm_client: OpenAICompatibleText2SQLClient,
+    run_dir_name: str,
+    example: BirdExample,
+    config: RunConfig,
+    sample_index: int,
+) -> None:
+    trace_name = f"q{example.question_id}_{example.db_id}"
+    if config.self_consistency_samples > 1:
+        trace_name = f"{trace_name}_s{sample_index + 1}"
+
+    llm_client.set_trace_context(
+        session_id=run_dir_name,
+        name=trace_name,
+        metadata={
+            "question_id": example.question_id,
+            "db_id": example.db_id,
+            "difficulty": example.difficulty,
+            "strategy": config.strategy_name,
+            "model": config.model,
+            "self_consistency_sample_index": sample_index,
+            "self_consistency_samples": config.self_consistency_samples,
+        },
+        tags=[config.strategy_name, example.db_id, example.difficulty],
+    )
+
+
+def _run_prediction_execution(
+    *,
+    predicted_sql: str,
+    generation_error: str | None,
+    db_context: DatabaseContext,
+    query_timeout_seconds: float,
+):
+    if not predicted_sql:
+        prediction_exec = execute_sql(
+            db_path=db_context.db_path,
+            sql="SELECT 1 WHERE 0",
+            timeout_seconds=query_timeout_seconds,
+        )
+        prediction_exec.error = generation_error or "Empty SQL output"
+        return prediction_exec
+
+    return execute_sql(
+        db_path=db_context.db_path,
+        sql=predicted_sql,
+        timeout_seconds=query_timeout_seconds,
+    )
+
+
+def _execution_vote_key(
+    *,
+    prediction_exec_error: str | None,
+    prediction_rows: list[tuple[Any, ...]],
+    ordered: bool,
+    float_precision: int,
+) -> str:
+    if prediction_exec_error is not None:
+        return f"error::{prediction_exec_error}"
+
+    canonical_rows = canonicalize_rows(
+        prediction_rows,
+        ordered=ordered,
+        float_precision=float_precision,
+    )
+    payload = json.dumps(canonical_rows, ensure_ascii=False, default=str)
+    return f"rows::{payload}"
+
+
 def _process_example(
     index: int,
     example: BirdExample,
@@ -111,40 +182,6 @@ def _process_example(
     llm_client: OpenAICompatibleText2SQLClient | None = None
     if strategy.requires_llm:
         llm_client = _get_thread_llm_client(config)
-        llm_client.set_trace_context(
-            session_id=run_dir_name,
-            name=f"q{example.question_id}_{example.db_id}",
-            metadata={
-                "question_id": example.question_id,
-                "db_id": example.db_id,
-                "difficulty": example.difficulty,
-                "strategy": config.strategy_name,
-                "model": config.model,
-            },
-            tags=[config.strategy_name, example.db_id, example.difficulty],
-        )
-
-    generation = strategy.generate(
-        example=example,
-        db_context=db_context,
-        llm_client=llm_client,
-        include_evidence=config.include_evidence,
-    )
-
-    predicted_sql = generation.sql.strip()
-    if not predicted_sql:
-        prediction_exec = execute_sql(
-            db_path=db_context.db_path,
-            sql="SELECT 1 WHERE 0",
-            timeout_seconds=config.query_timeout_seconds,
-        )
-        prediction_exec.error = generation.error or "Empty SQL output"
-    else:
-        prediction_exec = execute_sql(
-            db_path=db_context.db_path,
-            sql=predicted_sql,
-            timeout_seconds=config.query_timeout_seconds,
-        )
 
     gold_exec = execute_sql(
         db_path=db_context.db_path,
@@ -152,11 +189,64 @@ def _process_example(
         timeout_seconds=config.query_timeout_seconds,
     )
 
-    executable = prediction_exec.error is None
+    sample_records: list[dict[str, Any]] = []
+    vote_counts: Counter[str] = Counter()
+    first_seen_index_by_key: dict[str, int] = {}
 
-    exact_match = bool(predicted_sql) and normalize_sql(predicted_sql) == normalize_sql(
-        example.gold_sql
-    )
+    for sample_index in range(config.self_consistency_samples):
+        if llm_client is not None:
+            _set_trace_context_for_sample(
+                llm_client=llm_client,
+                run_dir_name=run_dir_name,
+                example=example,
+                config=config,
+                sample_index=sample_index,
+            )
+
+        generation = strategy.generate(
+            example=example,
+            db_context=db_context,
+            llm_client=llm_client,
+            include_evidence=config.include_evidence,
+        )
+        predicted_sql = generation.sql.strip()
+        prediction_exec = _run_prediction_execution(
+            predicted_sql=predicted_sql,
+            generation_error=generation.error,
+            db_context=db_context,
+            query_timeout_seconds=config.query_timeout_seconds,
+        )
+        vote_key = _execution_vote_key(
+            prediction_exec_error=prediction_exec.error,
+            prediction_rows=prediction_exec.rows,
+            ordered=config.ordered_result_compare,
+            float_precision=config.float_precision,
+        )
+        vote_counts[vote_key] += 1
+        if vote_key not in first_seen_index_by_key:
+            first_seen_index_by_key[vote_key] = sample_index
+
+        sample_records.append(
+            {
+                "sample_index": sample_index,
+                "generation": generation,
+                "predicted_sql": predicted_sql,
+                "prediction_exec": prediction_exec,
+                "vote_key": vote_key,
+            }
+        )
+
+    max_vote_size = max(vote_counts.values())
+    winning_vote_keys = [key for key, count in vote_counts.items() if count == max_vote_size]
+    winning_vote_key = min(winning_vote_keys, key=lambda key: first_seen_index_by_key[key])
+    selected_record = next(record for record in sample_records if record["vote_key"] == winning_vote_key)
+
+    selected_generation = selected_record["generation"]
+    predicted_sql = selected_record["predicted_sql"]
+    prediction_exec = selected_record["prediction_exec"]
+
+    executable = prediction_exec.error is None
+    exact_match = bool(predicted_sql) and normalize_sql(predicted_sql) == normalize_sql(example.gold_sql)
 
     exec_match = False
     if prediction_exec.error is None and gold_exec.error is None:
@@ -166,6 +256,52 @@ def _process_example(
             ordered=config.ordered_result_compare,
             float_precision=config.float_precision,
         )
+
+    sampled_predictions = []
+    for record in sample_records:
+        generation = record["generation"]
+        sample_prediction_exec = record["prediction_exec"]
+        sample_predicted_sql = record["predicted_sql"]
+        sampled_predictions.append(
+            {
+                "sample_index": record["sample_index"],
+                "predicted_sql": sample_predicted_sql,
+                "generation_error": generation.error,
+                "generation_latency_s": generation.latency_s,
+                "prediction_exec_error": sample_prediction_exec.error,
+                "prediction_exec_time_s": sample_prediction_exec.elapsed_s,
+                "prediction_row_count": (
+                    len(sample_prediction_exec.rows) if sample_prediction_exec.error is None else None
+                ),
+                "execution_vote_group_size": vote_counts[record["vote_key"]],
+                "selected_by_vote": record["vote_key"] == winning_vote_key,
+                "query_tool_calls": generation.query_tool_calls,
+                "prompt_tokens": generation.prompt_tokens,
+                "completion_tokens": generation.completion_tokens,
+                "total_tokens": generation.total_tokens,
+                "exact_match": (
+                    bool(sample_predicted_sql)
+                    and normalize_sql(sample_predicted_sql) == normalize_sql(example.gold_sql)
+                ),
+            }
+        )
+
+    total_query_tool_calls = sum(record["generation"].query_tool_calls for record in sample_records)
+    total_prompt_tokens = sum((record["generation"].prompt_tokens or 0) for record in sample_records)
+    total_completion_tokens = sum((record["generation"].completion_tokens or 0) for record in sample_records)
+    total_tokens = sum(
+        (
+            record["generation"].total_tokens
+            if record["generation"].total_tokens is not None
+            else (record["generation"].prompt_tokens or 0) + (record["generation"].completion_tokens or 0)
+        )
+        for record in sample_records
+    )
+    total_generation_latency_s = sum((record["generation"].latency_s or 0.0) for record in sample_records)
+    num_generation_errors = sum(1 for record in sample_records if record["generation"].error)
+
+    selected_sample_index = int(selected_record["sample_index"])
+    self_consistency_vote_fraction = max_vote_size / len(sample_records)
 
     return {
         "index": index,
@@ -178,14 +314,14 @@ def _process_example(
         "predicted_sql": predicted_sql,
         "strategy": config.strategy_name,
         "model": config.model,
-        "raw_output": generation.raw_output,
-        "generation_error": generation.error,
-        "generation_latency_s": generation.latency_s,
-        "query_tool_calls": generation.query_tool_calls,
-        "prompt_tokens": generation.prompt_tokens,
-        "completion_tokens": generation.completion_tokens,
-        "total_tokens": generation.total_tokens,
-        "messages": generation.messages,
+        "raw_output": selected_generation.raw_output,
+        "generation_error": selected_generation.error,
+        "generation_latency_s": selected_generation.latency_s,
+        "query_tool_calls": total_query_tool_calls,
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+        "total_tokens": total_tokens,
+        "messages": selected_generation.messages,
         "prediction_exec_error": prediction_exec.error,
         "gold_exec_error": gold_exec.error,
         "prediction_exec_time_s": prediction_exec.elapsed_s,
@@ -195,10 +331,22 @@ def _process_example(
         "executable": executable,
         "exact_match": exact_match,
         "exec_match": exec_match,
+        "num_generation_errors": num_generation_errors,
+        "self_consistency_samples": config.self_consistency_samples,
+        "self_consistency_selected_sample_index": selected_sample_index,
+        "self_consistency_vote_size": max_vote_size,
+        "self_consistency_vote_fraction": self_consistency_vote_fraction,
+        "self_consistency_num_tied_winners": len(winning_vote_keys),
+        "self_consistency_distinct_execution_results": len(vote_counts),
+        "self_consistency_total_generation_latency_s": total_generation_latency_s,
+        "self_consistency_sampled_predictions": sampled_predictions,
     }
 
 
 def run_experiment(config: RunConfig) -> dict[str, Any]:
+    if config.self_consistency_samples < 1:
+        raise ValueError("--self-consistency-samples must be >= 1")
+
     dataset_root = config.dataset_root
     examples = load_examples(dataset_root=dataset_root, split_file=config.split_file)
     examples = filter_examples(
@@ -292,11 +440,22 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
     exec_match_count = sum(1 for r in rows if r["exec_match"])
     exact_match_count = sum(1 for r in rows if r["exact_match"])
     executable_count = sum(1 for r in rows if r["executable"])
-    generation_error_count = sum(1 for r in rows if r["generation_error"])
+    generation_error_count = sum(
+        r.get("num_generation_errors", 1 if r["generation_error"] else 0) for r in rows
+    )
+    examples_with_generation_error = sum(
+        1 for r in rows if r.get("num_generation_errors", 1 if r["generation_error"] else 0) > 0
+    )
     gold_exec_error_count = sum(1 for r in rows if r["gold_exec_error"])
     query_tool_calls_total = sum(r["query_tool_calls"] for r in rows)
     prompt_tokens_total = sum(r["prompt_tokens"] or 0 for r in rows)
     completion_tokens_total = sum(r["completion_tokens"] or 0 for r in rows)
+    avg_vote_fraction = sum(r["self_consistency_vote_fraction"] for r in rows) / total
+    avg_vote_size = sum(r["self_consistency_vote_size"] for r in rows) / total
+    avg_distinct_execution_results = (
+        sum(r["self_consistency_distinct_execution_results"] for r in rows) / total
+    )
+    num_tie_examples = sum(1 for r in rows if r["self_consistency_num_tied_winners"] > 1)
 
     summary = {
         "started_at": started_at,
@@ -312,6 +471,7 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "num_exact_matches": exact_match_count,
         "exact_match_accuracy": exact_match_count / total,
         "num_generation_errors": generation_error_count,
+        "num_examples_with_generation_error": examples_with_generation_error,
         "num_gold_exec_errors": gold_exec_error_count,
         "num_query_tool_calls": query_tool_calls_total,
         "avg_query_tool_calls_per_example": query_tool_calls_total / total,
@@ -325,6 +485,12 @@ def run_experiment(config: RunConfig) -> dict[str, Any]:
         "ordered_result_compare": config.ordered_result_compare,
         "float_precision": config.float_precision,
         "max_workers": max_workers,
+        "self_consistency_samples": config.self_consistency_samples,
+        "self_consistency_enabled": config.self_consistency_samples > 1,
+        "avg_self_consistency_vote_fraction": avg_vote_fraction,
+        "avg_self_consistency_vote_size": avg_vote_size,
+        "avg_self_consistency_distinct_execution_results": avg_distinct_execution_results,
+        "num_self_consistency_tie_examples": num_tie_examples,
         "run_dir": str(run_dir),
         "predictions_path": str(run_dir / "predictions.jsonl"),
         "summary_path": str(run_dir / "summary.json"),

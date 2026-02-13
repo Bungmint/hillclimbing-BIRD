@@ -67,6 +67,7 @@ class RunConfig:
     reasoning_effort: str | None = "high"
     temperature: float = 0.0
     top_p: float | None = None
+    self_consistency_samples: int = 1
     max_output_tokens: int = 4096
     limit: int | None = None
     offset: int = 0
